@@ -31,12 +31,24 @@ from aivision.motion_seg import (
     STATIC, MOVING, UNKNOWN, POT_DYN, TEMP_WINDOW,
 )
 from aivision import detect as det
+from aivision.perception import (
+    CacheManifest, MANIFEST_NAME, id2label_from_manifest, load_frame_entry,
+)
 
 SEQ_DIR = Path("data/kitti/04")
 SRC = Path("outputs/pocs/orb_slam3")
 RHO_STEREO = SRC / "inv_depth_fused_rho_stereo_16bit.mkv"
 DENSE_DYN_FRAC = 0.3   # if the dense core marks > this frac of an object mask MOVING,
                        # the track is dynamic too (recall fallback for far movers)
+
+# Mapillary-Vistas movable-object classes (= the segmenter's dynamic set, same as
+# render_dynamic_overlay.py). Their pixels are folded into pot_dyn -- EXCEPT where
+# our geometry says sky/far-static (the sky->Car flicker), which stays static.
+SEG_MOVABLE_NAMES = frozenset({
+    "Bird", "Ground Animal", "Person", "Bicyclist", "Motorcyclist", "Other Rider",
+    "Bicycle", "Boat", "Bus", "Car", "Caravan", "Motorcycle", "On Rails",
+    "Other Vehicle", "Trailer", "Truck", "Wheeled Slow",
+})
 
 COLORS = {
     STATIC:  np.array([0, 200, 0], np.float32),     # green
@@ -109,6 +121,9 @@ def main():
     ap.add_argument("--end", type=int, default=-1)
     ap.add_argument("--no-objects", action="store_true", help="disable the object recall layer")
     ap.add_argument("--display-camera", default="image_2", help="RGB camera for the render base")
+    ap.add_argument("--fuse-segmenter", action="store_true",
+                    help="fold the Mask2Former movable-class pixels into pot_dyn (flicker-gated)")
+    ap.add_argument("--perception", type=Path, default=SRC / "perception")
     args = ap.parse_args()
 
     left = load_sequence(SEQ_DIR, camera="image_0")       # geometry frame (gray)
@@ -116,6 +131,17 @@ def main():
     K, W, H, N = left.K, left.width, left.height, left.n_frames
     poses = common.load_kitti_trajectory(SRC / "CameraTrajectory.txt")
     end = N if args.end < 0 else min(args.end, N)
+
+    seg_ids, id2lab = None, {}
+    if args.fuse_segmenter:
+        man = CacheManifest.load(args.perception / MANIFEST_NAME)
+        id2lab = id2label_from_manifest(man)
+        l2i = {v: k for k, v in id2lab.items()}
+        seg_ids = [l2i[n] for n in SEG_MOVABLE_NAMES if n in l2i]
+
+    def semantic(i):
+        sem = load_frame_entry(args.perception, i)["semantic"]
+        return sem if sem.shape == (H, W) else cv2.resize(sem, (W, H), interpolation=cv2.INTER_NEAREST)
 
     def bgr(i):  # geometry/detection base: grayscale image_0 (consistent with pose+rho)
         return cv2.cvtColor(cv2.imread(str(left.image_paths[i]), cv2.IMREAD_GRAYSCALE),
@@ -129,7 +155,7 @@ def main():
     # The object layer is a separate post-vote overlay (it carries the latching
     # pot_dyn/dynamic track state), so it is NOT stamped into the dense label here.
     tracker = det.Tracker()
-    labels, fwds, bwds, frame_dets = [], [], [], []
+    labels, fwds, bwds, frame_dets, valids = [], [], [], [], []
     rit = rho_stream(RHO_STEREO, W, H)
     rho_a = next(rit)
     for _ in range(args.start):
@@ -172,6 +198,7 @@ def main():
         fwds.append(f_obs.astype(np.float16))
         bwds.append(f_ba.astype(np.float16))
         frame_dets.append(dets_this)
+        valids.append(g.valid.copy() if args.fuse_segmenter else None)
         a, rho_a = b, rho_b
 
     # --- temporal vote --------------------------------------------------------
@@ -191,11 +218,34 @@ def main():
             dynamic = tracker.is_dynamic(tid)   # latched over the whole track
             final[m] = MOVING if dynamic else POT_DYN
             boxes.append((box, name, dynamic))
+
+        seg_labels = []
+        if args.fuse_segmenter:
+            sem = semantic(t)
+            seg_mov = np.isin(sem, seg_ids)
+            # flicker gate: segmenter calls it movable, but our geometry has no
+            # stereo AND says static -> sky/far-static (the sky->Car flicker). Keep
+            # static; do NOT promote. Everything else movable -> at least pot_dyn.
+            sky_like = (~valids[i]) & (final == STATIC)
+            fold = seg_mov & ~sky_like & (final != MOVING)
+            final[fold] = POT_DYN
+            # enrich: label the larger segmenter-only pot_dyn blobs with their class
+            comp = cv2.connectedComponentsWithStats(fold.astype(np.uint8), 8)
+            n, lbl, stats, cent = comp
+            for k in range(1, n):
+                if stats[k, cv2.CC_STAT_AREA] < 600:
+                    continue
+                cid = int(np.bincount(sem[lbl == k]).argmax())
+                seg_labels.append((int(cent[k][0]), int(cent[k][1]), id2lab.get(cid, str(cid))))
+
         frac = {c: 100.0 * (final == c).sum() / final.size for c in COLORS}
         for c in mean:
             mean[c] += frac[c] / len(voted)
         frame = overlay(disp_bgr(t), final, args.alpha)
         frame = draw_boxes(frame, boxes)
+        for cx, cy, name in seg_labels:   # segmenter class on folded movable regions
+            cv2.putText(frame, name, (cx - 20, cy), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.4, (0, 140, 255), 1, cv2.LINE_AA)
         writer.write(banner(frame, t, N, frac, args.window))
     writer.release()
     print(f"[motion-seg full] wrote {args.out}")
