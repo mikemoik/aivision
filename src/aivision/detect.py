@@ -24,12 +24,21 @@ import numpy as np
 import cv2
 
 MOVER_NAMES = ("car", "truck", "bus", "person", "bicycle", "motorcycle", "train")
+# Vulnerable road users that almost never "park" and are a hazard whether moving or
+# about to move -> default DYNAMIC (their slow/parallel motion is geometrically
+# near-unverifiable when passed by; a parked car, by contrast, IS verifiable).
+ALWAYS_DYNAMIC_NAMES = frozenset({"person"})
 SCORE_THR = 0.5
 MASK_THR = 0.5
-CLOSING_MARGIN = 0.5      # |closing_ratio - 1| above this -> moving
+CLOSING_MARGIN = 0.5      # |median closing_ratio - 1| above this -> dynamic
 Z_MIN, Z_MAX = 4.0, 50.0  # plausible ground-contact depth (m); far Z is too noisy
 GROUND_MIN_PX = 20        # min valid road-rho samples under a box to trust its Z
 MAX_DZ_EGO = 4.0          # reject |dZ| > this * v_ego as a ground-Z misread
+MIN_MEAS = 5              # min closing-ratio measurements before a track may be dynamic
+FRAC_DYN = 0.6            # median fraction of an object's pixels the dense classifier
+                          # calls MOVING above which the track is dynamic (2nd cue:
+                          # catches lateral movers the depth-closing test is blind to;
+                          # parked cars read ~0.00 here thanks to the near-field gates)
 
 _state: dict = {}
 
@@ -117,13 +126,16 @@ def is_dynamic_closing(ratio) -> bool:
 
 
 class Tracker:
-    """Greedy-IoU multi-frame tracker carrying a latching ``dynamic`` flag.
+    """Greedy-IoU multi-frame tracker; ROBUST, latching ``dynamic`` verdict.
 
-    Mover-class detections are stitched into tracks across frames so a track can
-    accumulate state: once marked dynamic (by the closing test OR the dense core)
-    it stays dynamic for life -- a momentary stop never reverts it. Per the
-    pot_dyn principle, a track that is never confirmed dynamic stays POT_DYN, not
-    static.
+    A potentially-dynamic-class object is POT_DYN by default and only becomes
+    dynamic when its motion is EXPLICITLY verified by non-static motion disparity:
+    the per-track MEDIAN ego-normalised closing ratio must sit robustly off the
+    static baseline (|median - 1| > margin) over >= MIN_MEAS measurements. A
+    single noisy frame can no longer promote a track -- roadside parked cars, whose
+    box-bottom ground-Z fluctuates as you pass them, have median ~1 (static) even
+    though individual frames trip the per-frame margin. The verdict latches (call
+    finalize() after the full pass): once dynamic, dynamic for the whole track.
     """
 
     def __init__(self, iou_thr: float = 0.2, max_gap: int = 5):
@@ -153,16 +165,41 @@ class Tracker:
             if tid is None:
                 tid = self.next_id
                 self.next_id += 1
-                self.tracks[tid] = {"box": d["box"], "last_t": t, "dynamic": False}
+                self.tracks[tid] = {"box": d["box"], "last_t": t, "cls": d["cls"],
+                                    "ratios": [], "fracs": [], "dynamic": False}
             else:
                 self.tracks[tid]["box"] = d["box"]
                 self.tracks[tid]["last_t"] = t
+                self.tracks[tid]["cls"] = d["cls"]
             assigned[di] = tid
         return assigned  # type: ignore[return-value]
 
-    def mark_dynamic(self, tid: int) -> None:
+    def add_ratio(self, tid: int, ratio) -> None:
+        """Record a measured closing ratio for a track (None measurements ignored)."""
+        if ratio is not None and tid in self.tracks:
+            self.tracks[tid]["ratios"].append(float(ratio))
+
+    def add_frac(self, tid: int, frac: float) -> None:
+        """Record the per-frame fraction of the object's pixels the dense core calls MOVING."""
         if tid in self.tracks:
-            self.tracks[tid]["dynamic"] = True
+            self.tracks[tid]["fracs"].append(float(frac))
+
+    def finalize(self, min_meas: int = MIN_MEAS, margin: float = CLOSING_MARGIN,
+                 frac_dyn: float = FRAC_DYN) -> None:
+        """Latch each track's dynamic verdict from TWO complementary cues (OR):
+          (1) median ego-normalised closing ratio robustly off 1  (depth-closing),
+          (2) median dense-MOVING pixel fraction over the mask > frac_dyn (motion
+              disparity; catches lateral movers the closing test is blind to).
+        Both aggregated over the track so a single noisy frame cannot promote.
+        """
+        for tr in self.tracks.values():
+            if category_name(tr["cls"]) in ALWAYS_DYNAMIC_NAMES:
+                tr["dynamic"] = True            # vulnerable road user -> always dynamic
+                continue
+            r, f = tr["ratios"], tr["fracs"]
+            by_closing = len(r) >= min_meas and abs(float(np.median(r)) - 1.0) > margin
+            by_frac = len(f) >= min_meas and float(np.median(f)) > frac_dyn
+            tr["dynamic"] = by_closing or by_frac
 
     def is_dynamic(self, tid: int) -> bool:
         return self.tracks.get(tid, {}).get("dynamic", False)

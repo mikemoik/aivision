@@ -112,7 +112,10 @@ def banner(img, t, N, frac, window):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--out", type=Path, default=SRC / "motion_seg_full.mp4")
+    ap.add_argument("--seq-dir", type=Path, default=SEQ_DIR, help="KITTI sequence dir")
+    ap.add_argument("--src", type=Path, default=SRC,
+                    help="dir holding CameraTrajectory.txt + rho stream + perception/")
+    ap.add_argument("--out", type=Path, default=None)
     ap.add_argument("--fps", type=int, default=10)
     ap.add_argument("--backend", default="sea_raft")
     ap.add_argument("--window", type=int, default=TEMP_WINDOW)
@@ -123,13 +126,20 @@ def main():
     ap.add_argument("--display-camera", default="image_2", help="RGB camera for the render base")
     ap.add_argument("--fuse-segmenter", action="store_true",
                     help="fold the Mask2Former movable-class pixels into pot_dyn (flicker-gated)")
-    ap.add_argument("--perception", type=Path, default=SRC / "perception")
+    ap.add_argument("--perception", type=Path, default=None)
     args = ap.parse_args()
 
-    left = load_sequence(SEQ_DIR, camera="image_0")       # geometry frame (gray)
-    disp = load_sequence(SEQ_DIR, camera=args.display_camera)  # RGB display base
+    src = args.src
+    rho_stereo = src / "inv_depth_fused_rho_stereo_16bit.mkv"
+    if args.out is None:
+        args.out = src / "motion_seg_full.mp4"
+    if args.perception is None:
+        args.perception = src / "perception"
+
+    left = load_sequence(args.seq_dir, camera="image_0")       # geometry frame (gray)
+    disp = load_sequence(args.seq_dir, camera=args.display_camera)  # display base
     K, W, H, N = left.K, left.width, left.height, left.n_frames
-    poses = common.load_kitti_trajectory(SRC / "CameraTrajectory.txt")
+    poses = common.load_kitti_trajectory(src / "CameraTrajectory.txt")
     end = N if args.end < 0 else min(args.end, N)
 
     seg_ids, id2lab = None, {}
@@ -156,7 +166,7 @@ def main():
     # pot_dyn/dynamic track state), so it is NOT stamped into the dense label here.
     tracker = det.Tracker()
     labels, fwds, bwds, frame_dets, valids = [], [], [], [], []
-    rit = rho_stream(RHO_STEREO, W, H)
+    rit = rho_stream(rho_stereo, W, H)
     rho_a = next(rit)
     for _ in range(args.start):
         rho_a = next(rit, rho_a)
@@ -182,15 +192,15 @@ def main():
             box_b = {tids_b[k]: dets_b[k]["box"] for k in range(len(dets_b))}
             for k, da in enumerate(dets_a):
                 tid = tids_a[k]
-                # confirm dynamic by (i) the ego-normalised closing test, or
-                # (ii) the dense core firing on the object mask (far-mover recall)
+                # EXPLICIT verification, two complementary cues (robust medians in
+                # finalize): (1) ego-normalised closing ratio, (2) fraction of the
+                # object's pixels the dense classifier calls MOVING.
                 if tid in box_b:
-                    cr = det.closing_ratio(da["box"], box_b[tid], rho_a, rho_b, v_ego)
-                    if det.is_dynamic_closing(cr):
-                        tracker.mark_dynamic(tid)
+                    tracker.add_ratio(tid, det.closing_ratio(
+                        da["box"], box_b[tid], rho_a, rho_b, v_ego))
                 m = da["mask"]
-                if m.any() and (lab[m] == MOVING).mean() > DENSE_DYN_FRAC:
-                    tracker.mark_dynamic(tid)
+                if m.any():
+                    tracker.add_frac(tid, float((lab[m] == MOVING).mean()))
                 dets_this.append((m, da["box"], det.category_name(da["cls"]), tid))
             dets_a, tids_a = dets_b, tids_b
 
@@ -200,6 +210,9 @@ def main():
         frame_dets.append(dets_this)
         valids.append(g.valid.copy() if args.fuse_segmenter else None)
         a, rho_a = b, rho_b
+
+    # latch each track's dynamic verdict from its median closing ratio (robust)
+    tracker.finalize()
 
     # --- temporal vote --------------------------------------------------------
     voted = temporal_vote([l for l in labels],

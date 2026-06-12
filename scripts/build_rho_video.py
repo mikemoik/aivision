@@ -68,27 +68,31 @@ def guided_smooth_rho(rho: np.ndarray, guide_gray: np.ndarray) -> np.ndarray:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--out", type=Path, default=SRC / "inv_depth_fused_mono_rho_16bit.mkv")
+    ap.add_argument("--seq-dir", type=Path, default=SEQ_DIR, help="KITTI sequence dir")
+    ap.add_argument("--src", type=Path, default=SRC,
+                    help="dir holding CameraTrajectory.txt; rho outputs land here")
+    ap.add_argument("--out", type=Path, default=None)
     ap.add_argument("--out-stereo", type=Path, default=None,
                     help="sibling stereo-ONLY rho stream (no mono-fill). "
                          "Default: <out stem>_stereo_16bit.mkv")
     ap.add_argument("--no-guided", action="store_true", help="skip Phase 1A guided filter")
     args = ap.parse_args()
 
-    out_path: Path = args.out
+    src: Path = args.src
+    out_path: Path = args.out or src / "inv_depth_fused_mono_rho_16bit.mkv"
     out_stereo: Path = args.out_stereo or out_path.with_name(
         out_path.stem.replace("_16bit", "").replace("_mono", "") + "_stereo_16bit.mkv")
-    tmp = SRC / "_invd_rho_frames"
-    tmp_stereo = SRC / "_invd_rho_stereo_frames"
+    tmp = src / "_invd_rho_frames"
+    tmp_stereo = src / "_invd_rho_stereo_frames"
     bf = FX * BASELINE
 
-    left_seq = load_sequence(SEQ_DIR, camera="image_0")
-    right_seq = load_sequence(SEQ_DIR, camera="image_1")
+    left_seq = load_sequence(args.seq_dir, camera="image_0")
+    right_seq = load_sequence(args.seq_dir, camera="image_1")
     W, H = left_seq.width, left_seq.height
     N = left_seq.n_frames
     cx, cy = left_seq.K[0, 2], left_seq.K[1, 2]
 
-    poses = common.load_kitti_trajectory(SRC / "CameraTrajectory.txt")
+    poses = common.load_kitti_trajectory(src / "CameraTrajectory.txt")
     R_wc_all = np.transpose(poses[:, :3, :3], (0, 2, 1))
     t_wc_all = -np.einsum("nij,nj->ni", R_wc_all, poses[:, :3, 3])
 
