@@ -1,0 +1,35 @@
+[project]
+name = "aivision"
+version = "0.1.0"
+description = "Structure-from-Motion for automotive front-camera footage"
+authors = [
+    { name = "mikemoik", email = "miswcom@googlemail.com" }
+]
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "numpy>=2.0",
+    "scipy>=1.13",
+    "opencv-contrib-python>=4.10",
+    "pillow>=10.4",
+    "matplotlib>=3.9",
+    "tqdm>=4.66",
+    "torch>=2.4",
+    "torchvision>=0.19",
+    "kornia>=0.7.3",
+    "open3d>=0.18",
+    "pycolmap>=3.10",
+    "jupyterlab>=4.2",
+    "typer>=0.12",
+    "transformers>=4.45",
+]
+
+[project.scripts]
+aivision = "aivision.cli:app"
+
+[build-system]
+requires = ["uv_build>=0.11.12,<0.12.0"]
+build-backend = "uv_build"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
