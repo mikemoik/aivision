@@ -69,11 +69,17 @@ def guided_smooth_rho(rho: np.ndarray, guide_gray: np.ndarray) -> np.ndarray:
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--out", type=Path, default=SRC / "inv_depth_fused_mono_rho_16bit.mkv")
+    ap.add_argument("--out-stereo", type=Path, default=None,
+                    help="sibling stereo-ONLY rho stream (no mono-fill). "
+                         "Default: <out stem>_stereo_16bit.mkv")
     ap.add_argument("--no-guided", action="store_true", help="skip Phase 1A guided filter")
     args = ap.parse_args()
 
     out_path: Path = args.out
+    out_stereo: Path = args.out_stereo or out_path.with_name(
+        out_path.stem.replace("_16bit", "").replace("_mono", "") + "_stereo_16bit.mkv")
     tmp = SRC / "_invd_rho_frames"
+    tmp_stereo = SRC / "_invd_rho_stereo_frames"
     bf = FX * BASELINE
 
     left_seq = load_sequence(SEQ_DIR, camera="image_0")
@@ -132,9 +138,10 @@ def main() -> None:
     rx = (uu - cx) / FX
     ry = (vv - cy) / FX  # fy = fx
 
-    if tmp.exists():
-        shutil.rmtree(tmp)
-    tmp.mkdir(parents=True)
+    for d in (tmp, tmp_stereo):
+        if d.exists():
+            shutil.rmtree(d)
+        d.mkdir(parents=True)
 
     cover_valid = 0.0
     calib_n = 0
@@ -212,21 +219,33 @@ def main() -> None:
         cv2.imwrite(str(tmp / f"f_{i:06d}.png"), pix16)
         cover_valid += valid_mask.mean()
 
+        # stereo-ONLY stream (no mono-fill): sky stays rho=0/invalid by
+        # construction (SGBM disp~0 there). This is the stream all motion/veto
+        # reasoning must read — mono hallucinates finite sky depth.
+        cv2.imwrite(str(tmp_stereo / f"f_{i:06d}.png"),
+                    encode_16(inv_stereo, stereo_ok))
+
     print(f"[fuse+encode] {N} frames in {time.time()-t0:.1f}s")
     print(f"[mean] valid coverage = {cover_valid/N:.1%}")
     print(f"[calib] mean affine a={a_sum/calib_n:.3f}  b={b_sum/calib_n:.4f}  "
           f"(rho_stereo = a*rho_mono + b)")
 
-    subprocess.run([
-        "ffmpeg", "-y", "-loglevel", "error",
-        "-framerate", "10",
-        "-i", str(tmp / "f_%06d.png"),
-        "-c:v", "ffv1", "-level", "3", "-coder", "1", "-context", "1",
-        "-pix_fmt", "gray16le",
-        str(out_path),
-    ], check=True)
+    def encode_mkv(frame_dir: Path, dst: Path) -> None:
+        subprocess.run([
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-framerate", "10",
+            "-i", str(frame_dir / "f_%06d.png"),
+            "-c:v", "ffv1", "-level", "3", "-coder", "1", "-context", "1",
+            "-pix_fmt", "gray16le",
+            str(dst),
+        ], check=True)
+
+    encode_mkv(tmp, out_path)
+    encode_mkv(tmp_stereo, out_stereo)
     shutil.rmtree(tmp)
+    shutil.rmtree(tmp_stereo)
     print(f"[write] {out_path}")
+    print(f"[write] {out_stereo}  (stereo-only, no mono-fill)")
 
 
 if __name__ == "__main__":
