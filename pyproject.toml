@@ -24,6 +24,7 @@ dependencies = [
     "ultralytics>=8.4.66",
     "gdown>=6.1.0",
     "onnxruntime>=1.26.0",
+    "gtsam>=4.3a0",
 ]
 
 [project.scripts]
