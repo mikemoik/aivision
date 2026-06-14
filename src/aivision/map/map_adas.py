@@ -22,16 +22,23 @@ import numpy as np
 from .frame import FrameInfo, GeoReference
 from .geometry import Geometry
 from .objects import MapClass, MapObject
+from .provenance import BuildManifest
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 class MapAdas:
     """In-memory ADAS map with JSON persistence."""
 
-    def __init__(self, frame: FrameInfo | None = None, georef: GeoReference | None = None):
+    def __init__(
+        self,
+        frame: FrameInfo | None = None,
+        georef: GeoReference | None = None,
+        provenance: BuildManifest | None = None,
+    ):
         self.frame = frame or FrameInfo()
         self.georef = georef
+        self.provenance = provenance or BuildManifest()
         self.objects: dict[str, MapObject] = {}
 
     # -- mutation -------------------------------------------------------
@@ -93,16 +100,18 @@ class MapAdas:
             "schema_version": SCHEMA_VERSION,
             "frame": self.frame.to_dict(),
             "georef": self.georef.to_dict() if self.georef else None,
+            "provenance": self.provenance.to_dict(),
             "objects": [o.to_dict() for o in self.objects.values()],
         }
 
     @classmethod
     def from_dict(cls, d: dict) -> "MapAdas":
-        if d.get("schema_version") != SCHEMA_VERSION:
+        if d.get("schema_version") not in (1, 2):
             raise ValueError(f"unsupported schema_version: {d.get('schema_version')}")
         m = cls(
             frame=FrameInfo.from_dict(d["frame"]),
             georef=GeoReference.from_dict(d["georef"]) if d.get("georef") else None,
+            provenance=BuildManifest.from_dict(d["provenance"]) if d.get("provenance") else None,
         )
         for od in d["objects"]:
             m.add(MapObject.from_dict(od))

@@ -1,6 +1,11 @@
-# ADAS map heavy binary data — keep the bindata/ dirs, ignore their contents
+# Map state — heavy local data: input dataset + per-run mapgen byproducts
+# (map-gen provenance/contracts/work + logs). Only map_adas.json (at the map
+# root, with its embedded BuildManifest) is tracked.
 map/**/bindata/*
 !map/**/bindata/.gitkeep
+
+# MapGen instances — track config.json only; ignore deps (models/binaries)
+mapgen/**/bindata/
 
 # Rendered media (videos/images) — keep output/ dirs project-wide, ignore contents
 **/output/*

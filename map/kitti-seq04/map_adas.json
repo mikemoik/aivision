@@ -1,10 +1,10 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "frame": {
     "name": "M",
     "provenance": "ORB-SLAM3 seq04 world (cam0 frame0, X-right Y-down Z-fwd, metric)",
     "units": "m",
-    "created": "2026-06-14"
+    "created": ""
   },
   "georef": {
     "T_M_to_ENU": [
@@ -42,6 +42,115 @@
       0.2,
       1.37,
       0.0
+    ]
+  },
+  "provenance": {
+    "run_id": "kitti-seq04-backfill",
+    "steps": [
+      {
+        "role": "slam",
+        "type": "ORB3",
+        "created": "2026-06-12T10:16:18+00:00",
+        "params": {
+          "baseline_m": 0.5372,
+          "sensor": "stereo"
+        },
+        "inputs": [
+          "bindata/input/odometry"
+        ],
+        "outputs": [
+          "map-gen/slam/out/trajectory.json"
+        ],
+        "note": "ORB-SLAM3 stereo; non-deterministic run-to-run, frozen as input artifact."
+      },
+      {
+        "role": "depth",
+        "type": "inv-depth-fused-mono-rho-gf",
+        "created": "2026-06-12T13:06:53+00:00",
+        "inputs": [
+          "bindata/input/odometry"
+        ],
+        "note": "artifact not migrated: outputs/pocs/orb_slam3/inv_depth_fused_mono_rho_gf_16bit.mkv"
+      },
+      {
+        "role": "segmentation",
+        "type": "Mapillary-Vistas",
+        "created": "2026-06-12T13:20:16+00:00",
+        "inputs": [
+          "bindata/input/odometry"
+        ],
+        "note": "per-frame cache not migrated: outputs/pocs/orb_slam3/perception"
+      },
+      {
+        "role": "lanes",
+        "type": "EgoLanes+gray-stereo",
+        "created": "2026-06-13T12:33:23+00:00",
+        "inputs": [
+          "slam",
+          "bindata/input/odometry"
+        ],
+        "outputs": [
+          "map-gen/lanes/out/lane_polylines.json",
+          "map-gen/lanes/out/lane_polylines_model.json"
+        ]
+      },
+      {
+        "role": "objects",
+        "type": "Vistas-seg+GTSRB-ViT+delineator",
+        "created": "2026-06-13T14:21:57+00:00",
+        "inputs": [
+          "slam",
+          "depth",
+          "segmentation",
+          "lanes"
+        ],
+        "outputs": [
+          "map-gen/objects/out/poles_signs_world.json"
+        ]
+      },
+      {
+        "role": "markings",
+        "type": "RLMD+lanemodel-plane",
+        "created": "2026-06-13T13:21:54+00:00",
+        "inputs": [
+          "slam",
+          "lanes"
+        ],
+        "outputs": [
+          "map-gen/markings/out/arrows_world.json"
+        ]
+      },
+      {
+        "role": "georef",
+        "type": "umeyama+gnss",
+        "created": "2026-06-14T12:46:48+00:00",
+        "params": {
+          "with_scale": true,
+          "enu_offset_m": [
+            0.2,
+            1.37,
+            0.0
+          ]
+        },
+        "inputs": [
+          "slam",
+          "input:oxts"
+        ],
+        "outputs": [
+          "map-gen/georef/out/georef.json"
+        ]
+      },
+      {
+        "role": "assemble",
+        "type": "ingest-v1",
+        "created": "2026-06-14T12:46:48+00:00",
+        "inputs": [
+          "lanes",
+          "objects",
+          "markings",
+          "georef"
+        ]
+      }
     ]
   },
   "objects": [
