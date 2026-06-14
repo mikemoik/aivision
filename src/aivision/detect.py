@@ -62,22 +62,38 @@ def category_name(cls: int) -> str:
     return _state["cats"][cls] if _state else str(cls)
 
 
-def detect(img_bgr: np.ndarray) -> list[dict]:
-    """Detect mover-class instances -> [{box(x0,y0,x1,y1), mask HxW bool, cls, score}]."""
+def infer(img_bgr: np.ndarray) -> tuple[list[dict], list[dict]]:
+    """One detector pass -> (movers, others) above SCORE_THR.
+
+    movers: mover-class instances with masks -> [{box, mask, cls, score}] (the
+            motion-seg recall layer).
+    others: every OTHER detected class, with masks -> [{box, mask, cls, score}].
+            These are the static-scene objects (traffic light, stop sign, bench, ...)
+            the user wants framed -- and pixel-overlaid -- apart from pot_dyn/dyn movers.
+    """
     import torch
     model, tf, movers, dev = load_detector()
     rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
     x = tf(torch.from_numpy(rgb).permute(2, 0, 1)).to(dev)
     with torch.no_grad():
         o = model([x])[0]
-    out = []
+    mov, oth = [], []
     for box, lab, sc, mask in zip(o["boxes"].cpu().numpy(), o["labels"].cpu().numpy(),
                                   o["scores"].cpu().numpy(), o["masks"].cpu().numpy()):
-        if sc < SCORE_THR or int(lab) not in movers:
+        if sc < SCORE_THR:
             continue
-        out.append(dict(box=box.astype(np.float64), mask=mask[0] > MASK_THR,
-                        cls=int(lab), score=float(sc)))
-    return out
+        if int(lab) in movers:
+            mov.append(dict(box=box.astype(np.float64), mask=mask[0] > MASK_THR,
+                            cls=int(lab), score=float(sc)))
+        else:
+            oth.append(dict(box=box.astype(np.float64), mask=mask[0] > MASK_THR,
+                            cls=int(lab), score=float(sc)))
+    return mov, oth
+
+
+def detect(img_bgr: np.ndarray) -> list[dict]:
+    """Detect mover-class instances -> [{box(x0,y0,x1,y1), mask HxW bool, cls, score}]."""
+    return infer(img_bgr)[0]
 
 
 def box_iou(a: np.ndarray, b: np.ndarray) -> float:

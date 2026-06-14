@@ -21,6 +21,9 @@ dependencies = [
     "jupyterlab>=4.2",
     "typer>=0.12",
     "transformers>=4.45",
+    "ultralytics>=8.4.66",
+    "gdown>=6.1.0",
+    "onnxruntime>=1.26.0",
 ]
 
 [project.scripts]

@@ -13,6 +13,14 @@ ignore mask of dynamic + sky classes (Mask2Former-Vistas) into the depth
 validity mask before backprojection. Kills moving-car smears and sky haze at
 the source. Frame indexing of the cache aligns 1:1 with the sequence because
 both sort the same image_2 PNGs by filename.
+
+Phase 2b (MOTION cleanup, preferred for dynamics): pass
+``--motion-mask <dynamic_cache.npz>`` to drop pixels the motion segmentation
+labelled MOVING (the cinematic's per-frame dense labels, 1=MOVING 2=POT_DYN).
+Unlike the semantic class drop, this rejects only *genuinely moving* surfaces and
+KEEPS parked cars / static structure — the right mask for a static reconstruction
+(and a clean Gaussian-splat init). The mask is dilated a few px to remove the
+moving object's depth halo. Add ``--drop-potdyn`` to also drop POT_DYN.
 """
 
 import argparse
@@ -80,6 +88,14 @@ def main() -> None:
         "--perception", type=Path, default=None,
         help="perception cache dir; AND a dynamic+sky ignore mask into the depth mask",
     )
+    ap.add_argument(
+        "--motion-mask", type=Path, default=None,
+        help="dynamic_cache.npz (mover_labels 1=MOVING 2=POT_DYN); drop moving pixels (keeps parked cars)",
+    )
+    ap.add_argument("--motion-dilate", type=int, default=6,
+                    help="dilate the moving mask by this many px to kill the depth halo")
+    ap.add_argument("--drop-potdyn", action="store_true",
+                    help="also drop POT_DYN pixels (default keeps them: parked-ish/static)")
     args = ap.parse_args()
 
     drop_ids: set[int] = set()
@@ -87,6 +103,13 @@ def main() -> None:
         drop_ids, id2label = _resolve_drop_ids(args.perception)
         dropped_names = ", ".join(sorted(id2label[i] for i in drop_ids))
         print(f"[semantic]  masking {len(drop_ids)} classes: {dropped_names}")
+
+    mover_labels = None
+    if args.motion_mask is not None:
+        mover_labels = np.load(args.motion_mask)["mover_labels"]   # (Nm, H, W) uint8
+        tgt = "MOVING+POT_DYN" if args.drop_potdyn else "MOVING"
+        print(f"[motion]    masking {tgt} from {args.motion_mask.name} "
+              f"({len(mover_labels)} frames, dilate {args.motion_dilate}px)")
 
     color_seq = load_sequence(SEQ_DIR, camera="image_2")
     W, H = color_seq.width, color_seq.height
@@ -111,7 +134,7 @@ def main() -> None:
 
     all_points = []
     all_colors = []
-    n_raw = n_kept = n_sem_dropped = 0
+    n_raw = n_kept = n_sem_dropped = n_motion_dropped = 0
     t0 = time.time()
     for i in range(N):
         raw = proc.stdout.read(frame_bytes)
@@ -128,6 +151,16 @@ def main() -> None:
             keep = ~np.isin(sem, list(drop_ids))
             n_sem_dropped += int((valid & ~keep).sum())
             valid &= keep
+
+        # Phase 2b: drop MOVING (and optionally POT_DYN) pixels from the motion seg.
+        if mover_labels is not None and i < len(mover_labels):
+            ml = mover_labels[i]
+            moving = (ml >= 1) if args.drop_potdyn else (ml == 1)
+            if args.motion_dilate > 0 and moving.any():
+                k = np.ones((args.motion_dilate, args.motion_dilate), np.uint8)
+                moving = cv2.dilate(moving.astype(np.uint8), k).astype(bool)
+            n_motion_dropped += int((valid & moving).sum())
+            valid &= ~moving
 
         if not valid.any():
             continue
@@ -154,6 +187,8 @@ def main() -> None:
     print(f"[stats]     raw valid={n_raw/1e6:.1f}M  kept (RHO {RHO_MIN}..{RHO_MAX})={n_kept/1e6:.1f}M")
     if drop_ids:
         print(f"[semantic]  dropped {n_sem_dropped/1e6:.1f}M dynamic/sky pixels pre-voxel")
+    if mover_labels is not None:
+        print(f"[motion]    dropped {n_motion_dropped/1e6:.1f}M moving-area pixels pre-voxel")
 
     points = np.concatenate(all_points)
     colors = np.concatenate(all_colors)
