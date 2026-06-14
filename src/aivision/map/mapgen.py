@@ -17,6 +17,7 @@ torch/ORB.
 
 from __future__ import annotations
 
+import importlib
 import json
 import logging
 import time
@@ -34,10 +35,24 @@ from .provenance import BuildManifest, StepRecord
 
 STEP_REGISTRY: dict[tuple[str, str], type["MapGenStep"]] = {}
 
+# Heavy steps live in their own modules so importing this framework never drags
+# in cv2 / torch / the ORB toolchain. They register on import; we import them
+# lazily at run() time, tolerating a missing backend (e.g. torch) so a run that
+# doesn't select that role still works.
+_STEP_MODULES = ("steps_slam",)
+
 
 def register_step(cls: type["MapGenStep"]) -> type["MapGenStep"]:
     STEP_REGISTRY[(cls.role, cls.type)] = cls
     return cls
+
+
+def _load_step_modules(log: logging.Logger) -> None:
+    for mod in _STEP_MODULES:
+        try:
+            importlib.import_module(f".{mod}", __package__)
+        except Exception as exc:  # missing backend → role stays unregistered
+            log.warning("step module %s not loaded: %s", mod, exc)
 
 
 @dataclass
@@ -168,6 +183,7 @@ class MapGen:
         log = self._setup_logging(run)
         log.info("MapGen '%s' → map '%s' run=%s", self.instance_dir.name,
                  self.config["map_name"], run_id)
+        _load_step_modules(log)
         self._ensure_bindata(log)
         manifest = BuildManifest(run_id=run_id)
         ctx = MapGenContext(self.instance_dir, self.layout, run, self.config, manifest, log)
@@ -177,6 +193,13 @@ class MapGen:
             out_dir = run.step_out(role)
             has_out = out_dir.exists() and any(out_dir.iterdir())
             selected = only is None or role in only
+            # Fail loud instead of silently passing through: if a step is
+            # explicitly selected+forced but its (role, type) has no registered
+            # implementation, the config type likely disagrees with the class.
+            if selected and force and key not in STEP_REGISTRY:
+                raise KeyError(
+                    f"step ({role}, {mtype}) selected for a forced run but no "
+                    f"registered implementation; registered={sorted(STEP_REGISTRY)}")
             if key in STEP_REGISTRY and selected and (force or not has_out):
                 STEP_REGISTRY[key](sc.get("params", {})).execute(ctx)
             else:
