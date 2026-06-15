@@ -15,6 +15,8 @@
     { "role": "slam",         "type": "ORB3",                   "params": { "baseline_m": 0.5372, "sensor": "stereo" } },
     { "role": "depth",        "type": "inv-depth-fused-mono-rho-gf", "params": {} },
     { "role": "segmentation", "type": "mapillary-vistas",       "params": {} },
+    { "role": "flow",         "type": "sea-raft",               "params": { "backend": "sea_raft", "dtype": "float16" } },
+    { "role": "dynamic",      "type": "motion-disparity",       "params": { "do_objects": true, "fuse_segmenter": false } },
     { "role": "lanes",        "type": "egolanes+gray-stereo",   "params": { "z_max": 40, "dz": 2.0 } },
     { "role": "objects",      "type": "vistas+gtsrb+delineator","params": { "pole_eps": 2.5, "sign_conf": 0.40, "gp_conf": 0.25 } },
     { "role": "markings",     "type": "rlmd+lanemodel",         "params": { "conf": 0.25, "cluster_eps": 2.0 } },

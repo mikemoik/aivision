@@ -13,6 +13,11 @@ draws every map object reprojected into each view:
   * lane markings   blue/pink polyline    (filtered lane model; the DB holds it)
   * road arrows     yellow filled glyph   (glyph Polyline)
 
+Plus the per-frame DYNAMIC layer (from the standalone ``dynamic`` step's mask
+cache, if the run has one): moving pixels tinted red, pot_dyn pixels orange.
+This is NOT in the map DB (the map is static-only) — it is overlaid live from the
+dynamic step's per-frame labels so the static map and the movers are seen together.
+
 Projection (cam0->world pose ``T_t = [R_t | C_t]``):
     X_cam = R_t.T @ (X_world - C_t);  u = fx*X/Z + cx, v = fy*Y/Z + cy (Z>0)
 Near segments are clipped at ``ZNEAR`` so glyphs don't pop as the car passes.
@@ -47,6 +52,84 @@ COL = {
     "lane_right": (190, 60, 255),  # pink
     "arrow": (0, 220, 255),      # yellow
 }
+
+# Dynamic-step label values (steps_dynamic.CLASS_NAMES) → BGR tints.
+DYN_MOVING, DYN_POT_DYN = 1, 3
+DYN_COL = {DYN_MOVING: (0, 0, 255), DYN_POT_DYN: (0, 140, 255)}  # red, orange
+
+
+def load_dynamic_label(run, t: int, h: int, w: int):
+    """Per-frame dynamic label map (HxW uint8) for source frame t, or None.
+
+    The dynamic cache has one entry per pair (0 … N-2), so the last frame has no
+    label. Returns None when the run has no dynamic step or t is out of range.
+    """
+    import cv2
+
+    p = run.step_out("dynamic") / f"dynamic_{t:06d}.npz"
+    if not p.exists():
+        return None
+    lab = np.load(p)["label"]
+    if lab.shape != (h, w):
+        lab = cv2.resize(lab, (w, h), interpolation=cv2.INTER_NEAREST)
+    return lab
+
+
+def paint_dynamic(im, label, alpha: float = 0.5) -> None:
+    """Tint moving (red) + pot_dyn (orange) pixels of the dynamic label in place."""
+    ov = im.copy()
+    touched = np.zeros(label.shape, bool)
+    for val, col in DYN_COL.items():
+        sel = label == val
+        ov[sel] = col
+        touched |= sel
+    blend = (touched[..., None] * alpha)
+    im[:] = (im * (1 - blend) + ov * blend).astype(np.uint8)
+
+
+def load_dynamic_boxes(run):
+    """Per-frame tracked mover boxes from the dynamic step's sidecar, or None."""
+    import json
+    p = run.step_out("dynamic") / "dynamic_boxes.json"
+    if not p.exists():
+        return None
+    return json.loads(p.read_text())["frames"]
+
+
+def paint_dynamic_boxes(im, label, boxes, alpha: float = 0.5) -> None:
+    """Box variant: draw the detector boxes and tint label pixels ONLY inside them.
+
+    Same box convention as render_motion_seg_full (red=dynamic, orange=pot_dyn).
+    Restricting the tint to inside the boxes drops the dense classifier's
+    off-object speckle (FOE/epipolar noise) so only detected movers are painted.
+    """
+    h, w = label.shape
+    box_mask = np.zeros((h, w), bool)
+    rects = []
+    for b in boxes:
+        x0, y0, x1, y1 = (int(round(v)) for v in b["box"])
+        x0, x1 = max(0, min(w, x0)), max(0, min(w, x1))
+        y0, y1 = max(0, min(h, y0)), max(0, min(h, y1))
+        if x1 <= x0 or y1 <= y0:
+            continue
+        box_mask[y0:y1, x0:x1] = True
+        rects.append((x0, y0, x1, y1, b))
+    # tint moving/pot_dyn label pixels, but only where they fall inside a box
+    ov = im.copy()
+    touched = np.zeros((h, w), bool)
+    for val, col in DYN_COL.items():
+        sel = (label == val) & box_mask
+        ov[sel] = col
+        touched |= sel
+    blend = (touched[..., None] * alpha)
+    im[:] = (im * (1 - blend) + ov * blend).astype(np.uint8)
+    # box outline + tag, coloured by the track-latched verdict
+    for x0, y0, x1, y1, b in rects:
+        col = DYN_COL[DYN_MOVING] if b["state"] == "moving" else DYN_COL[DYN_POT_DYN]
+        cv2.rectangle(im, (x0, y0), (x1, y1), col, 2)
+        tag = f"{b['name']} {'DYN' if b['state'] == 'moving' else 'pot_dyn'}"
+        cv2.putText(im, tag, (x0, max(10, y0 - 4)), cv2.FONT_HERSHEY_SIMPLEX,
+                    0.45, col, 1, cv2.LINE_AA)
 
 
 def read_calib(p: Path) -> dict[str, np.ndarray]:
@@ -206,11 +289,14 @@ def draw(im, g, Rinv, C, fx, fy, cx, cy, los: float) -> None:
                         0.5, COL["sign"], 1, cv2.LINE_AA)
 
 
-def banner(im, t, n) -> None:
+def banner(im, t, n, has_dyn: bool) -> None:
     ov = im.copy()
     cv2.rectangle(ov, (0, 0), (im.shape[1], 24), (20, 20, 20), -1)
     cv2.addWeighted(ov, 0.55, im, 0.45, 0, dst=im)
-    cv2.putText(im, f"map_adas reprojection  frame {t:03d}/{n - 1}", (8, 17),
+    txt = f"map_adas reprojection  frame {t:03d}/{n - 1}"
+    if has_dyn:
+        txt += "   [red=dynamic orange=pot_dyn]"
+    cv2.putText(im, txt, (8, 17),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.45, (240, 240, 240), 1, cv2.LINE_AA)
 
 
@@ -239,11 +325,18 @@ def main() -> None:
     ap.add_argument("--out", default=None)
     ap.add_argument("--fps", type=float, default=10.0)
     ap.add_argument("--los", type=float, default=100.0, help="line-of-sight cull (m)")
+    ap.add_argument("--no-dynamic", action="store_true",
+                    help="skip the dynamic moving/pot_dyn overlay even if cached")
+    ap.add_argument("--dynamic-mode", choices=("pixels", "boxes"), default="pixels",
+                    help="pixels=tint every classified mover pixel; "
+                         "boxes=draw detector boxes + tint only inside them")
+    ap.add_argument("--dyn-alpha", type=float, default=0.5)
     args = ap.parse_args()
 
     layout = MapLayout(args.map)
     db = Path(args.db) if args.db else layout.db
-    out = Path(args.out) if args.out else layout.output / "mapgen_overlay.mp4"
+    suffix = "_boxes" if args.dynamic_mode == "boxes" else ""
+    out = Path(args.out) if args.out else layout.output / f"mapgen_overlay{suffix}.mp4"
     seq = layout.input / "odometry"
 
     m = MapAdas.load(db)
@@ -257,9 +350,16 @@ def main() -> None:
     frames = sorted((seq / "image_2").glob("*.png"))
     n = min(len(frames), len(poses))
     h, w = cv2.imread(str(frames[0])).shape[:2]
+    has_dyn = (not args.no_dynamic) and (run.step_out("dynamic") / "manifest.json").exists()
+    dyn_boxes = load_dynamic_boxes(run) if (has_dyn and args.dynamic_mode == "boxes") else None
+    if has_dyn and args.dynamic_mode == "boxes" and dyn_boxes is None:
+        raise SystemExit(f"--dynamic-mode boxes needs dynamic_boxes.json in run {run_id} "
+                         "(re-run the dynamic step to produce it)")
     print(f"[overlay] map={db}  run={run_id}  {m!r}")
     print(f"[overlay] {n} frames {w}x{h}  poles={len(g['poles'])} gp={len(g['gposts'])} "
           f"signs={len(g['signs'])} tl={len(g['tls'])} lanes={len(g['lanes'])} arrows={len(g['arrows'])}")
+    print(f"[overlay] dynamic layer: "
+          f"{f'ON ({args.dynamic_mode}; red=moving orange=pot_dyn)' if has_dyn else 'off'}")
 
     out.parent.mkdir(parents=True, exist_ok=True)
     writer = cv2.VideoWriter(str(out), cv2.VideoWriter.fourcc(*"mp4v"), args.fps, (w, h))
@@ -267,9 +367,16 @@ def main() -> None:
         im = cv2.imread(str(frames[t]), cv2.IMREAD_COLOR)
         if im.shape[:2] != (h, w):
             im = cv2.resize(im, (w, h))
+        if has_dyn:
+            lab = load_dynamic_label(run, t, h, w)
+            if lab is not None and args.dynamic_mode == "pixels":
+                paint_dynamic(im, lab, alpha=args.dyn_alpha)
+            elif lab is not None and dyn_boxes is not None:
+                paint_dynamic_boxes(im, lab, dyn_boxes[t] if t < len(dyn_boxes) else [],
+                                    alpha=args.dyn_alpha)
         R, C = poses[t][:3, :3], poses[t][:3, 3]
         draw(im, g, R.T, C, fx, fy, cx, cy, args.los)
-        banner(im, t, n)
+        banner(im, t, n, has_dyn)
         writer.write(im)
     writer.release()
     print(f"[overlay] wrote {out}")

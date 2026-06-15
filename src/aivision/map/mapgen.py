@@ -39,8 +39,8 @@ STEP_REGISTRY: dict[tuple[str, str], type["MapGenStep"]] = {}
 # in cv2 / torch / the ORB toolchain. They register on import; we import them
 # lazily at run() time, tolerating a missing backend (e.g. torch) so a run that
 # doesn't select that role still works.
-_STEP_MODULES = ("steps_slam", "steps_depth", "steps_seg", "steps_lanes",
-                 "steps_objects", "steps_markings")
+_STEP_MODULES = ("steps_slam", "steps_depth", "steps_seg", "steps_flow",
+                 "steps_dynamic", "steps_lanes", "steps_objects", "steps_markings")
 
 
 def register_step(cls: type["MapGenStep"]) -> type["MapGenStep"]:
