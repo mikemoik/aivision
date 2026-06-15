@@ -39,7 +39,8 @@ STEP_REGISTRY: dict[tuple[str, str], type["MapGenStep"]] = {}
 # in cv2 / torch / the ORB toolchain. They register on import; we import them
 # lazily at run() time, tolerating a missing backend (e.g. torch) so a run that
 # doesn't select that role still works.
-_STEP_MODULES = ("steps_slam",)
+_STEP_MODULES = ("steps_slam", "steps_depth", "steps_seg", "steps_lanes",
+                 "steps_objects", "steps_markings")
 
 
 def register_step(cls: type["MapGenStep"]) -> type["MapGenStep"]:
@@ -143,7 +144,11 @@ class AssembleStep(MapGenStep):
         objs = []
         objs += load_poles_signs(ctx.upstream_out("objects") / "poles_signs_world.json")
         objs += load_arrows(ctx.upstream_out("markings") / "arrows_world.json")
-        objs += load_lane_polylines(ctx.upstream_out("lanes") / "lane_polylines.json")
+        # The map's lane belief is the FILTERED coupled lane model (RANSAC border
+        # reject + Whittaker smooth, consistent width) — the same representation
+        # the downstream consumers use — NOT the raw per-Z-bin border polylines
+        # (lane_polylines.json), which remain available as a lanes-role artifact.
+        objs += load_lane_polylines(ctx.upstream_out("lanes") / "lane_polylines_model.json")
         gr = GeoReference.from_dict(
             json.loads((ctx.upstream_out("georef") / "georef.json").read_text()))
         frame = FrameInfo(name="M", provenance=ctx.config.get("frame", {}).get("provenance", ""))

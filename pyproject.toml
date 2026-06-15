@@ -30,6 +30,14 @@ dependencies = [
 [project.scripts]
 aivision = "aivision.cli:app"
 
+[tool.uv]
+# ultralytics hard-deps plain `opencv-python`, which shares the same cv2/ files
+# as `opencv-contrib-python` (last install wins) and shadows the contrib-only
+# cv2.ximgproc.guidedFilter our depth step needs. The contrib build is a strict
+# superset, so drop the plain wheel everywhere (marker is always false) — uv then
+# never installs it and contrib's cv2 stays intact across `uv sync`.
+override-dependencies = ["opencv-python; sys_platform == 'never'"]
+
 [build-system]
 requires = ["uv_build>=0.11.12,<0.12.0"]
 build-backend = "uv_build"
