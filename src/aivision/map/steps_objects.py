@@ -23,10 +23,17 @@ object is recovered by:
      member frame (wide along-track baseline beats single-frame stereo, and honours
      [[feedback_no_anchor_to_ego_path]] — the estimate comes from observations).
 
-Out contract (``map-gen/objects/out/poles_signs_world.json``): ``{poles, signs,
-traffic_lights, guideposts}`` in the SLAM world (cam0) frame, metric meters; each
-object carries ``center`` + a size (``height``/``size``), ``n_frames`` and the
-triangulation residual ``res_m`` (consumed by ``ingest.load_poles_signs``).
+Out contract — two artifacts:
+  * ``map-gen/objects/out/poles_signs_world.json`` — the AGGREGATED map: ``{poles,
+    signs, traffic_lights, guideposts}`` in the SLAM world (cam0) frame, metric
+    meters; each object carries ``center`` + a size (``height``/``size``),
+    ``n_frames`` and the triangulation residual ``res_m`` (consumed by
+    ``ingest.load_poles_signs``).
+  * ``map-gen/objects/out/detections_by_frame.json`` — the VIRTUAL-CAMERA SENSOR:
+    the raw Pass-1 per-frame detections in camera coordinates that FED the
+    aggregation above (previously computed-then-discarded). Map-agnostic by design —
+    it replays what the camera saw each frame, not a reprojection of the finished
+    map. Read it via :class:`aivision.map.virtual_camera.VirtualCameraSensor`.
 """
 
 from __future__ import annotations
@@ -171,8 +178,12 @@ def lift_objects(
 ) -> dict:
     """Detect → coarse-3D → cluster → triangulate poles/signs/lights/guideposts.
 
-    ``poses`` is (N,4,4) cam0→world (Twc). Returns the ``poles_signs_world.json``
-    payload ``{poles, signs, traffic_lights, guideposts}`` in the SLAM world frame.
+    ``poses`` is (N,4,4) cam0→world (Twc). Returns ``(world, detections)``:
+    ``world`` = the ``poles_signs_world.json`` payload ``{poles, signs,
+    traffic_lights, guideposts}`` in the SLAM world frame (the aggregated map);
+    ``detections`` = the ``detections_by_frame.json`` virtual-camera-sensor payload
+    (the raw per-frame detections in camera coords that FED the aggregation — same
+    Pass-1 data, just persisted instead of discarded; see :func:`_detections_by_frame`).
     """
     import cv2
 
@@ -207,8 +218,13 @@ def lift_objects(
             if Z is None or not (4.0 < Z < zmax):
                 continue
             d0 = Kinv @ np.array([u, v, 1.0])
+            # pos_cam = d0 * Z is the detection in THIS frame's camera coords — the raw
+            # single-frame sensor output, captured before the world rotation below
+            # (ctr_w = C + pos_cam @ R.T). It is map-/world-agnostic by construction.
             sink.append({"frame": t, "ctr_w": C + (d0 * Z) @ R.T,
-                         "ray": ray_world(u, v, R), "origin": C.copy(), "h_px": h_px})
+                         "ray": ray_world(u, v, R), "origin": C.copy(), "h_px": h_px,
+                         "pos_cam": d0 * Z, "uv": (float(u), float(v)),
+                         "box": None, "score": None, "name": None})
 
     def lift_box(box, rho_t, R, C, zmax, t):
         x0, y0, x1, y1 = box
@@ -221,7 +237,10 @@ def lift_objects(
             return None
         d0 = Kinv @ np.array([u, v, 1.0])
         return {"frame": t, "ctr_w": C + (d0 * Z) @ R.T, "ray": ray_world(u, v, R),
-                "origin": C.copy(), "h_px": float(y1 - y0)}
+                "origin": C.copy(), "h_px": float(y1 - y0),
+                "pos_cam": d0 * Z, "uv": (float(u), float(v)),
+                "box": [float(x0), float(y0), float(x1), float(y1)],
+                "score": None, "name": None}
 
     # ---- Pass 1: detect, coarse 3D from fused rho, store bearing rays
     pole_obs, sign_obs, tl_obs, gp_obs = [], [], [], []
@@ -260,10 +279,13 @@ def lift_objects(
             o = lift_box(d["box"], rho_t, R, C, sign_zmax, t)
             if o is not None:
                 o["name"] = d["name"]
+                o["score"] = float(d["score"])
                 sign_obs.append(o)
         for d in gp_dets:
             o = lift_box(d["box"], rho_t, R, C, gp_zmax, t)
             if o is not None:
+                o["name"] = d.get("name")
+                o["score"] = float(d["score"])
                 gp_obs.append(o)
 
     _say(f"[objects] coarse obs: {len(pole_obs)} pole, {len(sign_obs)} sign, "
@@ -317,7 +339,7 @@ def lift_objects(
         _say(f"   sign #{k} {s['name']:<24} X={c[0]:6.1f} Z={c[2]:6.1f}m  "
              f"~{s['size']:.2f}m obs={s['n_frames']} agree={s['agree']:.2f} res={s['res_m']:.2f}m")
 
-    return {
+    world = {
         "poles": [{"center": p["center"].tolist(), "height": p["size"],
                    "n_frames": p["n_frames"], "res_m": p["res_m"]} for p in poles],
         "signs": [{"name": s["name"], "center": s["center"].tolist(),
@@ -328,6 +350,71 @@ def lift_objects(
         "guideposts": [{"center": g["center"].tolist(), "height": g["size"],
                         "n_frames": g["n_frames"], "res_m": g["res_m"]} for g in guideposts],
     }
+
+    detections = _detections_by_frame(
+        [("pole", pole_obs), ("traffic_light", tl_obs),
+         ("sign", sign_obs), ("guidepost", gp_obs)],
+        N, W, H, K, fy)
+    _say(f"[objects] virtual-sensor: {sum(len(v) for v in detections['frames'].values())} "
+         f"per-frame detections over {N} frames")
+    return world, detections
+
+
+def _detections_by_frame(class_obs, n_frames, width, height, K, fy,
+                         sigma_floor: float = 0.15, sigma_rel: float = 0.03) -> dict:
+    """Group the raw per-frame object detections into the virtual-camera sensor
+    artifact, built from the SAME map data structures as the aggregated map.
+
+    Each detection is a :class:`~aivision.map.objects.MapObject` (Pole / TrafficSign
+    / TrafficLight / GuidePost) constructed via the shared ``ingest.make_*`` builders
+    — byte-identical structure to ``map_adas.json``, only the geometry lives in THIS
+    frame's CAMERA coordinates (``pos_cam = K^{-1}[u,v,1]·Z`` captured before any pose
+    rotation; no world / map reference). It replays exactly what the camera saw each
+    frame (single-frame depth noise, FOV limits, real FP/FN), independent of the
+    downstream aggregated belief store. Single-frame positional sigma grows with range
+    (``sigma_floor + sigma_rel·depth``) to reflect mono-rho depth noise.
+
+    Image-space detector outputs that aren't part of the 3D geometry (pixel box,
+    centroid, height, score, range) are carried in each object's ``attributes``.
+    ``class_obs`` = list of (class_name, obs_list). Returns a self-describing dict:
+    header (intrinsics, frame size) + ``frames[str(t)] -> [MapObject.to_dict(), ...]``.
+    """
+    from .ingest import make_guidepost, make_pole, make_sign, make_traffic_light
+    from .virtual_camera import sensor_T_fveh_cam
+
+    builders = {"pole": (make_pole, "pole"), "traffic_light": (make_traffic_light, "tl"),
+                "sign": (make_sign, "sign"), "guidepost": (make_guidepost, "gp")}
+
+    T_sensor = sensor_T_fveh_cam()       # cam0 -> f_veh(t): reframe each detection
+    frames: dict[int, list] = {t: [] for t in range(n_frames)}
+    for cls, obs in class_obs:
+        make, prefix = builders[cls]
+        for k, o in enumerate(obs):
+            pc = np.asarray(o["pos_cam"], dtype=float)
+            t = o["frame"]
+            depth = float(pc[2])
+            size = float(o["h_px"]) * depth / fy           # physical size from pixel height
+            sigma = sigma_floor + sigma_rel * depth
+            az = float(np.degrees(np.arctan2(pc[0], pc[2])))    # +right
+            el = float(np.degrees(np.arctan2(-pc[1], pc[2])))   # +up
+            attrs = {
+                "image_uv": [float(o["uv"][0]), float(o["uv"][1])],
+                "box": o.get("box"),
+                "h_px": float(o["h_px"]),
+                "score": o.get("score"),
+                "range_m": float(np.linalg.norm(pc)),
+                "depth_m": depth,
+                "bearing_deg": [az, el],
+            }
+            if o.get("name") is not None:
+                attrs["name"] = o["name"]
+            obj = make(f"{prefix}_f{t:06d}_{k}", pc, size, sigma,
+                       n_obs=1, created_frame=t, attributes=attrs)
+            frames[t].append(obj.transformed(T_sensor).to_dict())   # camera -> f_veh(t)
+
+    from .virtual_camera import make_artifact
+    return make_artifact({str(t): frames[t] for t in range(n_frames)},
+                         n_frames=n_frames, image_size=(width, height), K=K)
 
 
 def _poses_from_trajectory(traj_json: Path) -> np.ndarray:
@@ -360,7 +447,7 @@ class ObjectsStep(MapGenStep):
         rho_video = ctx.upstream_out("depth") / "inv_depth_rho16.mkv"
         ctx.log.info("objects: seq=%s cache=%s rho=%s", seq_dir, cache_dir, rho_video.name)
 
-        payload = lift_objects(
+        payload, detections = lift_objects(
             seq_dir, poses, cache_dir, rho_video,
             sign_conf=float(self.params.get("sign_conf", 0.40)),
             gp_conf=float(self.params.get("gp_conf", 0.25)),
@@ -370,7 +457,9 @@ class ObjectsStep(MapGenStep):
 
         out_dir = ctx.out("objects")
         (out_dir / "poles_signs_world.json").write_text(json.dumps(payload, indent=1))
+        (out_dir / "detections_by_frame.json").write_text(json.dumps(detections))
         ctx.log.info("objects: %d poles, %d signs, %d lights, %d guideposts",
                      len(payload["poles"]), len(payload["signs"]),
                      len(payload["traffic_lights"]), len(payload["guideposts"]))
-        return ["map-gen/objects/out/poles_signs_world.json"]
+        return ["map-gen/objects/out/poles_signs_world.json",
+                "map-gen/objects/out/detections_by_frame.json"]

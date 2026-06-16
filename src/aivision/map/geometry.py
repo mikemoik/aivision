@@ -34,10 +34,30 @@ def _arr(x: Any, shape: tuple[int, ...]) -> Array:
     return a
 
 
+def _apply_T(T: Array, p: Array) -> Array:
+    """Apply a 4x4 homogeneous transform to a 3-vector point."""
+    T = np.asarray(T, float)
+    return T[:3, :3] @ np.asarray(p, float) + T[:3, 3]
+
+
+def _rot_cov(R: Array, cov: Array) -> Array:
+    """Rotate a 3x3 covariance: ``R Σ Rᵀ``."""
+    R = np.asarray(R, float)
+    return R @ np.asarray(cov, float) @ R.T
+
+
 class Geometry:
     """Base class: serialization dispatch + the (stubbed) fuse contract."""
 
     kind: ClassVar[str] = "geometry"
+
+    def transformed(self, T: Array) -> "Geometry":
+        """Return a copy rigidly transformed by the 4x4 ``T`` (frame change).
+
+        Used to reframe a primitive from one Euclidean frame to another (e.g.
+        cam-world M -> f_veh_t0). Covariances rotate by ``T``'s rotation block.
+        """
+        raise NotImplementedError
 
     def to_dict(self) -> dict:  # pragma: no cover - overridden
         raise NotImplementedError
@@ -70,6 +90,10 @@ class GaussianPoint(Geometry):
     def __post_init__(self) -> None:
         self.mean = _arr(self.mean, (3,))
         self.cov = _arr(self.cov, (3, 3))
+
+    def transformed(self, T: Array) -> "GaussianPoint":
+        R = np.asarray(T, float)[:3, :3]
+        return GaussianPoint(_apply_T(T, self.mean), _rot_cov(R, self.cov))
 
     def to_dict(self) -> dict:
         return {"kind": self.kind, "mean": self.mean.tolist(), "cov": self.cov.tolist()}
@@ -111,6 +135,13 @@ class GaussianPose(Geometry):
     def rotation(self) -> Rotation:
         return Rotation.from_matrix(self.T[:3, :3])
 
+    def transformed(self, T: Array) -> "GaussianPose":
+        R = np.asarray(T, float)[:3, :3]
+        cov = self.cov.copy()
+        cov[:3, :3] = _rot_cov(R, self.cov[:3, :3])     # translation block
+        cov[3:, 3:] = _rot_cov(R, self.cov[3:, 3:])     # rotation block
+        return GaussianPose(T=np.asarray(T, float) @ self.T, cov=cov)
+
     def to_dict(self) -> dict:
         return {"kind": self.kind, "T": self.T.tolist(), "cov": self.cov.tolist()}
 
@@ -131,6 +162,9 @@ class LineSegment(Geometry):
     kind: ClassVar[str] = "line_segment"
     a: GaussianPoint
     b: GaussianPoint
+
+    def transformed(self, T: Array) -> "LineSegment":
+        return LineSegment(self.a.transformed(T), self.b.transformed(T))
 
     def to_dict(self) -> dict:
         return {"kind": self.kind, "a": self.a.to_dict(), "b": self.b.to_dict()}
@@ -154,6 +188,9 @@ class Polyline(Geometry):
     kind: ClassVar[str] = "polyline"
     verts: list[GaussianPoint]
     closed: bool = False
+
+    def transformed(self, T: Array) -> "Polyline":
+        return Polyline([v.transformed(T) for v in self.verts], closed=self.closed)
 
     def to_dict(self) -> dict:
         return {
@@ -191,6 +228,10 @@ class OrientedBox(Geometry):
     def __post_init__(self) -> None:
         self.extents = _arr(self.extents, (3,))
         self.extents_cov = _arr(self.extents_cov, (3, 3))
+
+    def transformed(self, T: Array) -> "OrientedBox":
+        # extents are body-frame half-sizes — invariant under a rigid frame change
+        return OrientedBox(self.pose.transformed(T), self.extents.copy(), self.extents_cov.copy())
 
     def to_dict(self) -> dict:
         return {

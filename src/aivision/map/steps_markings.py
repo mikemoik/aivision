@@ -153,6 +153,10 @@ def lift_arrows(
 
     from .. import road_marking as rm
     from ..kitti import _read_calib, load_sequence
+    from .ingest import make_arrow
+    from .virtual_camera import make_artifact, sensor_T_fveh_cam
+
+    T_sensor = sensor_T_fveh_cam()       # cam0 -> f_veh(t): reframe each detection
 
     def _say(msg: str) -> None:
         (log.info if log is not None else print)(msg)
@@ -183,7 +187,14 @@ def lift_arrows(
     # ---- Pass 1: detect, fit per-frame ground plane from the lane model, lift, ego-lane gate
     footprints = []                                  # {frame, cls, pts(world), centroid}
     contours_by_frame: dict[int, list] = {}          # raw detection outlines for verification
+    arrow_dets_by_frame: dict[int, list] = {}        # per-frame RoadArrow (camera frame) = sensor
     n_arrow_frames = 0
+
+    def _sensor_artifact() -> dict:
+        return make_artifact(
+            {str(t): arrow_dets_by_frame.get(t, []) for t in range(N)},
+            n_frames=N, image_size=(color.width, color.height), K=K,
+            note="per-frame ego-lane road arrows (RoadArrow) in f_veh(t)")
     for t in range(start, end):
         imC = cv2.imread(str(color.image_paths[t]), cv2.IMREAD_COLOR)
         dets = [d for d in rm.detect(imC, conf=conf) if d["name"] in ARROW_CLASSES]
@@ -229,10 +240,33 @@ def lift_arrows(
             cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             contours_by_frame.setdefault(t, []).extend(cnts)
 
+            # per-frame sensor: fit a RoadArrow to THIS frame's footprint in CAMERA coords
+            # (the single-frame arrow the camera saw, before pose-transform to the map)
+            Xc = (Xw - C) @ R
+            n_cam = n @ R
+            if n_cam[1] < 0:                                # orient consistently (Y-down)
+                n_cam = -n_cam
+            fwd_cam = lane_tangent(cz) @ R
+            try:
+                a = fit_arrow(Xc, fwd_cam, n_cam)
+            except Exception:
+                a = None
+            if a is not None:
+                aid = f"arrow_f{t:06d}_{len(arrow_dets_by_frame.get(t, []))}"
+                obj = make_arrow(
+                    aid, a["centroid"], a["forward"], a["glyph_world"], created_frame=t,
+                    attributes={"cls": d["name"], "length": a["length"], "width": a["width"],
+                                "yaw_to_lane_deg": a["yaw_to_lane_deg"],
+                                "range_m": float(np.linalg.norm(a["centroid"])),
+                                "depth_m": float(a["centroid"][2])})
+                arrow_dets_by_frame.setdefault(t, []).append(
+                    obj.transformed(T_sensor).to_dict())   # camera -> f_veh(t)
+
     _say(f"[arrows] {n_arrow_frames} arrow frames, {len(footprints)} ego-lane footprints")
     if not footprints:
         _say("[arrows] nothing in the ego lane")
-        return {"arrows": [], "footprints": [], "contours_by_frame": {}}
+        return {"arrows": [], "footprints": [], "contours_by_frame": {},
+                "detections_by_frame": _sensor_artifact()}
 
     # ---- Cluster footprints across frames → physical arrows, fit pose + shape
     cents = np.array([f["centroid"] for f in footprints])
@@ -259,7 +293,8 @@ def lift_arrows(
         _say(f"   #{k} {a['cls']:<20} Z={c[2]:6.1f}m  L={a['length']:.2f} W={a['width']:.2f} "
              f"yaw={a['yaw_to_lane_deg']:+.1f}deg  obs={a['n_frames']}")
 
-    return {"arrows": arrows, "footprints": footprints, "contours_by_frame": contours_by_frame}
+    return {"arrows": arrows, "footprints": footprints, "contours_by_frame": contours_by_frame,
+            "detections_by_frame": _sensor_artifact()}
 
 
 def _poses_from_trajectory(traj_json: Path) -> np.ndarray:
@@ -302,5 +337,10 @@ class MarkingsStep(MapGenStep):
 
         out_dir = ctx.out("markings")
         (out_dir / "arrows_world.json").write_text(json.dumps(payload, indent=1))
-        ctx.log.info("markings: %d arrows → arrows_world.json", len(payload))
-        return ["map-gen/markings/out/arrows_world.json"]
+        det = result["detections_by_frame"]
+        (out_dir / "arrow_detections_by_frame.json").write_text(json.dumps(det))
+        n_arrow_det = sum(len(v) for v in det["frames"].values())
+        ctx.log.info("markings: %d arrows → arrows_world.json; per-frame arrows %d over %d frames",
+                     len(payload), n_arrow_det, det["n_frames"])
+        return ["map-gen/markings/out/arrows_world.json",
+                "map-gen/markings/out/arrow_detections_by_frame.json"]

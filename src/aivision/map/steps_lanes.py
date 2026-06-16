@@ -91,6 +91,7 @@ def build_lane_cloud(
 
     sgbm = _make_sgbm()
     pts: dict[int, list] = {0: [], 1: []}
+    cam_by_frame: dict[int, dict[int, np.ndarray]] = {}   # per-frame camera-coord lane pts
     cam_track = []
     valid_px = total_px = 0
 
@@ -123,7 +124,9 @@ def build_lane_cloud(
             u, v, z = xs[good], ys[good], Z[good]
             X = (u - cx) * z / fx
             Y = (v - cy) * z / fy
-            Xw = np.stack([X, Y, z], 1) @ Rt.T + Ct      # cam0 → world
+            Xc = np.stack([X, Y, z], 1)                   # camera coords (the per-frame sensor)
+            cam_by_frame.setdefault(t, {})[cls] = Xc
+            Xw = Xc @ Rt.T + Ct                           # cam0 → world (aggregated map)
             pts[cls].append(Xw)
 
     out_pts = {cls: (np.concatenate(v, 0) if v else np.empty((0, 3))) for cls, v in pts.items()}
@@ -131,6 +134,7 @@ def build_lane_cloud(
          f"({100 * valid_px / max(total_px, 1):.1f}%)  "
          f"ego_left={len(out_pts[0])} ego_right={len(out_pts[1])} pts")
     return {"pts": out_pts, "cam_track": np.asarray(cam_track),
+            "cam_by_frame": cam_by_frame, "n_frames": N, "image_size": (color.width, color.height),
             "intrinsics": (fx, fy, cx, cy, baseline),
             "validity": (valid_px, total_px)}
 
@@ -172,6 +176,61 @@ def fit_border_polylines(pts: dict, *, dz: float = 3.0, minpts: int = 15) -> dic
         out[side] = [[round(float(xs[i]), 4), round(float(ys[i]), 4), round(float(zs[i]), 4)]
                      for i in range(len(zs))]
     return out
+
+
+# --- 2b. per-frame ego-lane borders = the VIRTUAL CAMERA SENSOR (camera frame) ---
+
+def _bin_border_cam(P: np.ndarray, dz: float, minpts: int) -> list:
+    """Single border polyline (camera frame): median X,Y per Z-bin, 1-2-1 smoothed."""
+    P = np.asarray(P, dtype=float)
+    if len(P) == 0:
+        return []
+    z, x, y = P[:, 2], P[:, 0], P[:, 1]
+    edges = np.arange(z.min(), z.max() + dz, dz)
+    zc, xb, yb = [], [], []
+    for i in range(len(edges) - 1):
+        sel = (z >= edges[i]) & (z < edges[i + 1])
+        if int(sel.sum()) < minpts:
+            continue
+        zc.append(0.5 * (edges[i] + edges[i + 1]))
+        xb.append(float(np.median(x[sel])))
+        yb.append(float(np.median(y[sel])))
+    if len(zc) < 2:
+        return []
+    xs, ys = _smooth_121(np.array(xb)), _smooth_121(np.array(yb))
+    return [[round(float(xs[i]), 4), round(float(ys[i]), 4), round(float(zc[i]), 4)]
+            for i in range(len(zc))]
+
+
+def build_lane_detections(cloud: dict, *, dz: float = 3.0, minpts: int = 6) -> dict:
+    """Per-frame ego-left/ego-right borders (camera frame) as LaneMarking objects.
+
+    Reads the ``cam_by_frame`` the cloud builder kept (the camera-frame lane points
+    that, transformed by each pose, fed the aggregated map). Each frame's border is a
+    :class:`LaneMarking` (same structure as the map), only in CAMERA coords — the
+    single-frame ego-lane the camera actually saw, independent of the map.
+    """
+    from .ingest import make_lane_marking
+    from .virtual_camera import make_artifact, sensor_T_fveh_cam
+
+    T_sensor = sensor_T_fveh_cam()       # cam0 -> f_veh(t): reframe each detection
+    n_frames = int(cloud["n_frames"])
+    fx, fy, cx, cy, _ = cloud["intrinsics"]
+    K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1.0]])
+    frames: dict[str, list] = {str(t): [] for t in range(n_frames)}
+    for t, by_cls in cloud["cam_by_frame"].items():
+        for cls, P in by_cls.items():
+            verts = _bin_border_cam(P, dz, minpts)
+            if len(verts) < 2:
+                continue
+            side = CLASS_NAME[cls]
+            obj = make_lane_marking(
+                f"{side}_f{t:06d}", side, verts, created_frame=t,
+                method="per-frame median X,Y per Z-bin, 1-2-1 smoothed (camera frame)",
+                attributes={"n_pts": int(len(P))})
+            frames[str(t)].append(obj.transformed(T_sensor).to_dict())   # camera -> f_veh(t)
+    return make_artifact(frames, n_frames=n_frames, image_size=cloud["image_size"], K=K,
+                         note="per-frame ego-lane borders (LaneMarking) in f_veh(t)")
 
 
 # --- 3. coupled lane model (refactored fit_lane_model core) -----------------
@@ -322,10 +381,15 @@ class LanesStep(MapGenStep):
         (out_dir / "lane_polylines.json").write_text(json.dumps(poly))
         model = fit_lane_model_from_pts(pts, dz=dz, log=ctx.log)
         (out_dir / "lane_polylines_model.json").write_text(json.dumps(model))
-        ctx.log.info("lanes: polylines %d/%d verts, model %d/%d verts",
+        det = build_lane_detections(cloud)
+        (out_dir / "lane_detections_by_frame.json").write_text(json.dumps(det))
+        n_lane_det = sum(len(v) for v in det["frames"].values())
+        ctx.log.info("lanes: polylines %d/%d verts, model %d/%d verts, "
+                     "per-frame borders %d over %d frames",
                      len(poly["left"]), len(poly["right"]),
-                     len(model["left"]), len(model["right"]))
+                     len(model["left"]), len(model["right"]), n_lane_det, det["n_frames"])
         return [
             "map-gen/lanes/out/lane_polylines.json",
             "map-gen/lanes/out/lane_polylines_model.json",
+            "map-gen/lanes/out/lane_detections_by_frame.json",
         ]

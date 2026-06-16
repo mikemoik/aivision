@@ -325,6 +325,9 @@ def main() -> None:
     ap.add_argument("--out", default=None)
     ap.add_argument("--fps", type=float, default=10.0)
     ap.add_argument("--los", type=float, default=100.0, help="line-of-sight cull (m)")
+    ap.add_argument("--lanes-only", action="store_true",
+                    help="draw only the ego-lane markings (drop poles/signs/lights/"
+                         "arrows and the dynamic layer)")
     ap.add_argument("--no-dynamic", action="store_true",
                     help="skip the dynamic moving/pot_dyn overlay even if cached")
     ap.add_argument("--dynamic-mode", choices=("pixels", "boxes"), default="pixels",
@@ -335,14 +338,25 @@ def main() -> None:
 
     layout = MapLayout(args.map)
     db = Path(args.db) if args.db else layout.db
-    suffix = "_boxes" if args.dynamic_mode == "boxes" else ""
+    suffix = "_lanes" if args.lanes_only else ("_boxes" if args.dynamic_mode == "boxes" else "")
     out = Path(args.out) if args.out else layout.output / f"mapgen_overlay{suffix}.mp4"
     seq = layout.input / "odometry"
 
     m = MapAdas.load(db)
+    # The map is now in f_veh_t0, but this overlay projects with the cam-M SLAM
+    # trajectory and its draw geometry assumes cam-frame UP (-Y); reframe the map
+    # back to M (inverse of T_fveh0_M) so the projection + glyphs stay consistent.
+    from aivision.calibration import KittiCalibration
+    T_M_fveh0 = np.linalg.inv(KittiCalibration.load().T_fveh0_M())
+    for oid in list(m.objects):
+        m.objects[oid] = m.objects[oid].transformed(T_M_fveh0)
     run_id = resolve_run(layout, m, args.run_id)
     run = layout.run(run_id)
     g = collect(m)
+    if args.lanes_only:                       # keep lanes, drop every other glyph
+        g = {"poles": [], "gposts": [], "signs": [], "tls": [],
+             "lanes": g["lanes"], "arrows": []}
+        args.no_dynamic = True
     poses = poses_from_traj(run.step_out("slam") / "trajectory.json")
     calib = read_calib(seq / "calib.txt")
     K = calib["P2"][:3, :3]

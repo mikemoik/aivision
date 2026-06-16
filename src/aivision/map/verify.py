@@ -6,12 +6,20 @@ ground truth. The acceptance criterion is therefore *stability*, not
 reproducibility: does the regenerated map describe the same world, within
 tolerance?
 
-The two maps live in their own gauge-free map frames ``M`` (each run's ORB
-world is arbitrary up to a rigid+scale transform), so they cannot be compared
-in ``M`` directly. Instead each map is lifted into the shared Earth frame
-(local ENU) via its *own* stored georeference, and the comparison happens
-there. This is exactly the "traceability over reproducibility" thesis: the
-method may wander, but the georeferenced map must not.
+Each map lives in its own gauge-free map frame (``f_veh_t0`` now, historically
+``M``; each run's world is arbitrary up to a rigid+scale transform), so they
+cannot be compared in the map frame directly. Instead each map is lifted into
+the shared Earth frame (local ENU) via its *own* stored georeference, and the
+comparison happens there — so this verifier is FRAME-AGNOSTIC: it works whatever
+map frame each side uses (and even compares an old ``M`` map against an
+``f_veh_t0`` one), because the georef absorbs the frame. This is exactly the
+"traceability over reproducibility" thesis: the method may wander, but the
+georeferenced map must not.
+
+NB the georef rotation delta is naturally large when the two sides use different
+map frames (M vs f_veh_t0) — it is REPORTED only, never gated. The georef
+translation/scale gates assume both sides share a gauge convention (e.g. two
+f_veh_t0 runs); they are not meaningful across a frame change.
 
 What is compared:
   * per-class nearest-neighbour object matching within a tolerance radius →
@@ -75,9 +83,9 @@ class VerifyTolerances:
     arrow_yaw_deg: float = 10.0     # max arrow heading delta
 
 
-# -- representative geometry → a single point in frame M ----------------
+# -- representative geometry → a single point in the map frame ----------
 def representative_point(obj: MapObject) -> np.ndarray | None:
-    """A single point standing in for an object's location, in frame ``M``."""
+    """A single point standing in for an object's location, in the map frame."""
     slot = next(iter(obj.geometry))
     g = obj.geometry[slot]
     if isinstance(g, GaussianPoint):
@@ -213,8 +221,8 @@ def _lane_deviation(gt_m: MapAdas, new_m: MapAdas) -> list[dict]:
 def _arrow_yaw_enu(m: MapAdas, obj: MapObject) -> float:
     """Heading of the arrow's forward axis in the ENU ground plane (deg)."""
     pose: GaussianPose = obj.geometry["pose"]
-    fwd_M = pose.T[:3, 2]  # columns are [right, down, forward]
-    d = _direction_to_enu(m.georef, fwd_M)
+    fwd = pose.T[:3, 2]  # local arrow axes [right, down, forward]; col 2 = forward
+    d = _direction_to_enu(m.georef, fwd)  # preserved under the f_veh_t0 reframe
     return float(np.degrees(np.arctan2(d[0], d[1])))  # atan2(E, N) from north
 
 

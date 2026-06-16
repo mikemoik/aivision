@@ -71,6 +71,22 @@ class MapObject:
         if frame is not None:
             self.last_update_frame = frame
 
+    def transformed(self, T) -> "MapObject":
+        """Return a copy with all geometry rigidly reframed by the 4x4 ``T``.
+
+        Reframes the object from one Euclidean frame to another (e.g. cam-world
+        M -> f_veh_t0, or per-frame camera -> f_veh(t)) without rebuilding it, so
+        the cam-world geometry builders stay untouched.
+        """
+        return type(self)(
+            id=self.id,
+            geometry={name: g.transformed(T) for name, g in self.geometry.items()},
+            attributes=dict(self.attributes),
+            n_obs=self.n_obs,
+            created_frame=self.created_frame,
+            last_update_frame=self.last_update_frame,
+        )
+
     def to_dict(self) -> dict:
         return {
             "id": self.id,

@@ -27,8 +27,10 @@ from pathlib import Path
 
 import numpy as np
 
+from ..calibration import KittiCalibration
 from .frame import FrameInfo, GeoReference
-from .ingest import load_arrows, load_lane_polylines, load_oxts_enu, load_poles_signs
+from .ingest import (load_arrows, load_lane_polylines, load_oxts_fveh_enu,
+                     load_poles_signs)
 from .layout import MAPGEN_ROOT, MAPS_ROOT, MapLayout, MapRun
 from .map_adas import MapAdas
 from .provenance import BuildManifest, StepRecord
@@ -111,21 +113,38 @@ class MapGenStep:
         return rec
 
 
+def _vehicle_centres_fveh0(traj_json: Path) -> np.ndarray:
+    """f_veh (vehicle) centres in the f_veh_t0 world frame from the SLAM trajectory.
+
+    The SLAM trajectory is ORB cam0 poses ``T_M_cam0(t)``; the vehicle pose in
+    f_veh_t0 is ``C·T_M_cam0(t)·C⁻¹`` (C = T_fveh_cam0), whose translation is the
+    f_veh centre. See :mod:`aivision.calibration`.
+    """
+    cal = KittiCalibration.load()
+    rows = np.asarray(json.loads(traj_json.read_text())["poses"], dtype=float)
+    P = np.tile(np.eye(4), (len(rows), 1, 1))
+    P[:, :3, :4] = rows.reshape(-1, 3, 4)
+    return np.array([cal.cam0_pose_to_vehicle(p)[:3, 3] for p in P])
+
+
 @register_step
 class GeorefStep(MapGenStep):
-    """Fit map(M) -> ENU from the SLAM trajectory vs GNSS (rigid Umeyama)."""
+    """Fit map(f_veh_t0) -> ENU from the vehicle f_veh track vs GNSS (rigid Umeyama).
+
+    Both sides are now the VEHICLE (f_veh) track: the f_veh centres in f_veh_t0
+    (from SLAM) against the OXTS GNSS pose of f_veh per frame.
+    """
 
     role = "georef"
     type = "umeyama+gnss"
     inputs = ["slam", "input:oxts"]
 
     def process(self, ctx: MapGenContext) -> list[str]:
-        traj = json.loads((ctx.upstream_out("slam") / "trajectory.json").read_text())
-        cam_centres = np.asarray(traj["poses"], dtype=float)[:, [3, 7, 11]]
-        enu, datum = load_oxts_enu(ctx.input("oxts") / "data", len(cam_centres))
+        veh_centres = _vehicle_centres_fveh0(ctx.upstream_out("slam") / "trajectory.json")
+        enu, datum = load_oxts_fveh_enu(ctx.input("oxts") / "data", len(veh_centres))
         offset = np.asarray(self.params.get("enu_offset_m", [0.0, 0.0, 0.0]), dtype=float)
         gr = GeoReference.from_point_correspondences(
-            cam_centres, enu, datum,
+            veh_centres, enu, datum,
             with_scale=self.params.get("with_scale", True), enu_offset=offset,
         )
         (ctx.out("georef") / "georef.json").write_text(json.dumps(gr.to_dict(), indent=2))
@@ -151,10 +170,17 @@ class AssembleStep(MapGenStep):
         objs += load_lane_polylines(ctx.upstream_out("lanes") / "lane_polylines_model.json")
         gr = GeoReference.from_dict(
             json.loads((ctx.upstream_out("georef") / "georef.json").read_text()))
-        frame = FrameInfo(name="M", provenance=ctx.config.get("frame", {}).get("provenance", ""))
+        # The upstream world artifacts are in cam-world M (x-right,y-down,z-fwd);
+        # reframe every object into the canonical f_veh_t0 world (x-fwd,y-left,z-up)
+        # via the static T_fveh0_M from the single-source calibration.
+        T = KittiCalibration.load().T_fveh0_M()
+        frame = FrameInfo(
+            name="f_veh_t0",
+            provenance="f_veh at frame 0 (x-fwd, y-left, z-up); reframed from ORB "
+                       "cam0 world M via T_fveh_cam0 (single-source calibration)")
         m = MapAdas(frame=frame, georef=gr, provenance=ctx.manifest)
         for o in objs:
-            m.add(o)
+            m.add(o.transformed(T))
         m.save(ctx.layout.db)
         return ["map_adas.json"]
 

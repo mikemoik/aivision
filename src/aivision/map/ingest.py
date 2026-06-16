@@ -57,6 +57,79 @@ def _rot_from_forward(forward: np.ndarray) -> np.ndarray:
     return np.column_stack([right, down, f])
 
 
+# -- shared object builders ---------------------------------------------
+# One place that fixes each class's geometry SLOTS, so the AGGREGATED map
+# (load_poles_signs, frame M) and the per-frame VIRTUAL CAMERA SENSOR
+# (steps_objects, camera frame) build byte-identical structures from the same
+# code. The frame is whatever ``center`` is expressed in; "up" is -Y in both the
+# map frame M and the camera frame (X-right, Y-down, Z-forward).
+
+def make_pole(obj_id, center, height, sigma=_DEFAULT_SIGMA_M, *,
+              n_obs=1, created_frame=None, attributes=None) -> Pole:
+    c = np.asarray(center, dtype=float)
+    half = 0.5 * float(height or 0.0)
+    cov = _iso_cov(sigma)
+    shaft = LineSegment(GaussianPoint(c + half * UP, cov), GaussianPoint(c - half * UP, cov))
+    return Pole(obj_id, {"shaft": shaft}, attributes={"height": height, **(attributes or {})},
+                n_obs=n_obs, created_frame=created_frame, last_update_frame=created_frame)
+
+
+def make_sign(obj_id, center, size, sigma=_DEFAULT_SIGMA_M, *,
+              n_obs=1, created_frame=None, attributes=None) -> TrafficSign:
+    c = np.asarray(center, dtype=float)
+    half = 0.5 * float(size or 0.0)
+    mount = GaussianPose.from_Rt(np.eye(3), c, _pose_cov(sigma, _UNKNOWN_ROT_VAR))
+    face = OrientedBox(GaussianPose.from_Rt(np.eye(3), c, _pose_cov(sigma, _UNKNOWN_ROT_VAR)),
+                       extents=[half, half, 0.01])
+    return TrafficSign(obj_id, {"mount": mount, "face": face},
+                       attributes=attributes or {}, n_obs=n_obs,
+                       created_frame=created_frame, last_update_frame=created_frame)
+
+
+def make_traffic_light(obj_id, center, height, sigma=_DEFAULT_SIGMA_M, *,
+                       n_obs=1, created_frame=None, attributes=None) -> TrafficLight:
+    c = np.asarray(center, dtype=float)
+    h = float(height if height is not None else 0.3)
+    mount = GaussianPose.from_Rt(np.eye(3), c, _pose_cov(sigma, _UNKNOWN_ROT_VAR))
+    box = OrientedBox(GaussianPose.from_Rt(np.eye(3), c, _pose_cov(sigma, _UNKNOWN_ROT_VAR)),
+                      extents=[0.15, 0.5 * h, 0.15])
+    return TrafficLight(obj_id, {"mount": mount, "box": box},
+                        attributes={"height": height, **(attributes or {})}, n_obs=n_obs,
+                        created_frame=created_frame, last_update_frame=created_frame)
+
+
+def make_guidepost(obj_id, center, height, sigma=_DEFAULT_SIGMA_M, *,
+                   n_obs=1, created_frame=None, attributes=None) -> GuidePost:
+    c = np.asarray(center, dtype=float)
+    return GuidePost(obj_id, {"point": GaussianPoint(c, _iso_cov(sigma))},
+                     attributes={"height": height, **(attributes or {})}, n_obs=n_obs,
+                     created_frame=created_frame, last_update_frame=created_frame)
+
+
+def make_arrow(obj_id, centroid, forward, glyph, sigma=_DEFAULT_SIGMA_M, *,
+               yaw_var_deg: float = 5.0, n_obs=1, created_frame=None,
+               attributes=None) -> RoadArrow:
+    c = np.asarray(centroid, dtype=float)
+    R = _rot_from_forward(forward)
+    pose = GaussianPose.from_Rt(R, c, _pose_cov(sigma, np.radians(yaw_var_deg) ** 2))
+    gl = Polyline([GaussianPoint(np.asarray(v, dtype=float), _iso_cov(sigma)) for v in glyph],
+                  closed=True)
+    return RoadArrow(obj_id, {"pose": pose, "glyph": gl}, attributes=attributes or {},
+                     n_obs=n_obs, created_frame=created_frame, last_update_frame=created_frame)
+
+
+def make_lane_marking(obj_id, side, verts, sigma=_DEFAULT_SIGMA_M, *,
+                      n_obs=1, created_frame=None, method=None, attributes=None) -> LaneMarking:
+    line = Polyline([GaussianPoint(np.asarray(p, dtype=float), _iso_cov(sigma)) for p in verts])
+    attrs = {"side": side}
+    if method is not None:
+        attrs["method"] = method
+    if attributes:
+        attrs.update(attributes)
+    return LaneMarking(obj_id, {"line": line}, attributes=attrs, n_obs=n_obs,
+                       created_frame=created_frame, last_update_frame=created_frame)
+
+
 # -- individual adapters ------------------------------------------------
 def load_poles_signs(path: str | Path, default_sigma: float = _DEFAULT_SIGMA_M) -> list:
     """Parse ``poles_signs_world.json`` -> Pole/TrafficSign/TrafficLight/GuidePost."""
@@ -64,41 +137,22 @@ def load_poles_signs(path: str | Path, default_sigma: float = _DEFAULT_SIGMA_M) 
     objs: list = []
 
     for i, p in enumerate(d.get("poles", [])):
-        c = np.asarray(p["center"], dtype=float)
-        half = 0.5 * float(p.get("height", 0.0))
-        cov = _iso_cov(p.get("res_m", default_sigma))
-        shaft = LineSegment(GaussianPoint(c + half * UP, cov), GaussianPoint(c - half * UP, cov))
-        objs.append(Pole(f"pole_{i}", {"shaft": shaft}, attributes={"height": p.get("height")},
-                         n_obs=p.get("n_frames", 1)))
+        objs.append(make_pole(f"pole_{i}", p["center"], p.get("height"),
+                              p.get("res_m", default_sigma), n_obs=p.get("n_frames", 1)))
 
     for i, s in enumerate(d.get("signs", [])):
-        c = np.asarray(s["center"], dtype=float)
-        sigma = s.get("res_m", default_sigma)
-        half = 0.5 * float(s.get("size", 0.0))
-        mount = GaussianPose.from_Rt(np.eye(3), c, _pose_cov(sigma, _UNKNOWN_ROT_VAR))
-        face = OrientedBox(GaussianPose.from_Rt(np.eye(3), c, _pose_cov(sigma, _UNKNOWN_ROT_VAR)),
-                           extents=[half, half, 0.01])
-        objs.append(TrafficSign(f"sign_{i}", {"mount": mount, "face": face},
-                                attributes={"name": s.get("name"), "agree": s.get("agree")},
-                                n_obs=s.get("n_frames", 1)))
+        objs.append(make_sign(f"sign_{i}", s["center"], s.get("size"),
+                              s.get("res_m", default_sigma), n_obs=s.get("n_frames", 1),
+                              attributes={"name": s.get("name"), "agree": s.get("agree")}))
 
     for i, t in enumerate(d.get("traffic_lights", [])):
-        c = np.asarray(t["center"], dtype=float)
-        sigma = t.get("res_m", default_sigma)
-        h = float(t.get("height", 0.3))
-        mount = GaussianPose.from_Rt(np.eye(3), c, _pose_cov(sigma, _UNKNOWN_ROT_VAR))
-        box = OrientedBox(GaussianPose.from_Rt(np.eye(3), c, _pose_cov(sigma, _UNKNOWN_ROT_VAR)),
-                          extents=[0.15, 0.5 * h, 0.15])
-        objs.append(TrafficLight(f"tl_{i}", {"mount": mount, "box": box},
-                                 attributes={"height": t.get("height")},
-                                 n_obs=t.get("n_frames", 1)))
+        objs.append(make_traffic_light(f"tl_{i}", t["center"], t.get("height"),
+                                       t.get("res_m", default_sigma),
+                                       n_obs=t.get("n_frames", 1)))
 
     for i, g in enumerate(d.get("guideposts", [])):
-        c = np.asarray(g["center"], dtype=float)
-        cov = _iso_cov(g.get("res_m", default_sigma))
-        objs.append(GuidePost(f"gp_{i}", {"point": GaussianPoint(c, cov)},
-                              attributes={"height": g.get("height")},
-                              n_obs=g.get("n_frames", 1)))
+        objs.append(make_guidepost(f"gp_{i}", g["center"], g.get("height"),
+                                   g.get("res_m", default_sigma), n_obs=g.get("n_frames", 1)))
     return objs
 
 
@@ -107,16 +161,12 @@ def load_arrows(path: str | Path, default_sigma: float = _DEFAULT_SIGMA_M) -> li
     arrows = json.loads(Path(path).read_text())
     objs: list[RoadArrow] = []
     for i, a in enumerate(arrows):
-        c = np.asarray(a["centroid"], dtype=float)
-        R = _rot_from_forward(a["forward"])
-        pose = GaussianPose.from_Rt(R, c, _pose_cov(default_sigma, (np.radians(5.0)) ** 2))
-        glyph = Polyline([GaussianPoint(np.asarray(v, dtype=float), _iso_cov(default_sigma))
-                          for v in a.get("glyph_world", [])], closed=True)
-        objs.append(RoadArrow(f"arrow_{i}", {"pose": pose, "glyph": glyph},
-                              attributes={"cls": a.get("cls"), "length": a.get("length"),
-                                          "width": a.get("width"),
-                                          "yaw_to_lane_deg": a.get("yaw_to_lane_deg")},
-                              n_obs=a.get("n_frames", 1)))
+        objs.append(make_arrow(f"arrow_{i}", a["centroid"], a["forward"],
+                               a.get("glyph_world", []), default_sigma,
+                               attributes={"cls": a.get("cls"), "length": a.get("length"),
+                                           "width": a.get("width"),
+                                           "yaw_to_lane_deg": a.get("yaw_to_lane_deg")},
+                               n_obs=a.get("n_frames", 1)))
     return objs
 
 
@@ -128,10 +178,8 @@ def load_lane_polylines(path: str | Path, default_sigma: float = _DEFAULT_SIGMA_
         pts = d.get(side)
         if not pts:
             continue
-        line = Polyline([GaussianPoint(np.asarray(p, dtype=float), _iso_cov(default_sigma))
-                         for p in pts])
-        objs.append(LaneMarking(f"lane_{side}", {"line": line},
-                                attributes={"side": side, "method": d.get("method")}))
+        objs.append(make_lane_marking(f"lane_{side}", side, pts, default_sigma,
+                                      method=d.get("method")))
     return objs
 
 
@@ -150,6 +198,36 @@ def load_oxts_enu(oxts_dir: str | Path, n: int) -> tuple[np.ndarray, tuple[float
     north = np.radians(ll[:, 0] - lat0) * _R_EARTH
     enu = np.stack([east, north, ll[:, 2] - alt0], axis=1)
     return enu, (float(lat0), float(lon0), float(alt0))
+
+
+# f_veh sits FVEH_LATERAL_LEFT (m, +left in the vehicle x-fwd/y-left/z-up frame)
+# from the OXTS/IMU antenna — the IMU is 0.32 m left of the centreline, so f_veh
+# is 0.32 m to its right. See [[reference_kitti_calibration]].
+FVEH_LATERAL_LEFT = -0.32
+
+
+def load_oxts_fveh_enu(oxts_dir: str | Path, n: int,
+                       lateral_left: float = FVEH_LATERAL_LEFT
+                       ) -> tuple[np.ndarray, tuple[float, float, float]]:
+    """OXTS samples 0..n-1 -> the f_veh (vehicle-centreline) ENU track + datum.
+
+    The OXTS position is the IMU/GPS antenna; f_veh is that origin shifted
+    ``(0, lateral_left, 0)`` in the vehicle frame (x-fwd, y-left, z-up) — i.e.
+    laterally onto the centreline. We rotate that body-frame lateral shift into
+    ENU by the per-frame OXTS yaw (field 5: 0=east, CCW+), so each frame's f_veh
+    ENU is the GNSS pose of f_veh for that frame.
+    """
+    oxts_dir = Path(oxts_dir)
+    rows = [np.loadtxt(oxts_dir / f"{i:010d}.txt") for i in range(n)]
+    ll = np.array([r[:3] for r in rows])
+    yaw = np.array([r[5] for r in rows])
+    lat0, lon0, alt0 = ll[0]
+    east = np.radians(ll[:, 1] - lon0) * _R_EARTH * math.cos(math.radians(lat0))
+    north = np.radians(ll[:, 0] - lat0) * _R_EARTH
+    imu_enu = np.stack([east, north, ll[:, 2] - alt0], axis=1)
+    left = np.stack([-np.sin(yaw), np.cos(yaw), np.zeros_like(yaw)], axis=1)  # +left in ENU
+    fveh_enu = imu_enu + lateral_left * left
+    return fveh_enu, (float(lat0), float(lon0), float(alt0))
 
 
 # Measured along-track GNSS bias (truth - ours) in ENU metres, carried over
