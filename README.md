@@ -492,6 +492,92 @@ uv run aivision pointcloud-video data/1.mp4 --backend colmap     # auto-detects 
 translation is unit-length; monocular two-view geometry leaves scale
 unobservable.
 
+### How the monocular pipeline works
+
+`aivision pointcloud-video` (`pipeline.py`) samples every Nth video frame
+(default 3, because adjacent dashcam frames have too little parallax) and
+runs one of three back ends. A fourth command, `pose-guided-refine`, is a
+second pass over an existing reconstruction. This track is independent of the
+map pipeline: ORB-SLAM3 never sees these features, and none of this feeds the
+ADAS map.
+
+| `--backend` | Poses from | Points from | Scale |
+|---|---|---|---|
+| `vo` (default) | chained two-view ORB odometry | two-view ORB triangulation | arbitrary; metric only after the GPS anchor |
+| `colmap-from-vo` | the same VO, GPS-anchored, then bundle-adjusted | SIFT or DISK + LightGlue, triangulated against those poses | metric (needs a GPS sidecar) |
+| `colmap` | COLMAP incremental mapper | COLMAP SIFT | metric with GPS priors, else arbitrary |
+
+**Keypoints.** Three different feature types appear, one per role:
+
+| Feature | Where | Details |
+|---|---|---|
+| **ORB** (OpenCV `cv2.ORB`) | VO front end, `features.py` | 4000 features per frame, FAST threshold 7 (lowered from the default 20 for low-texture road), otherwise OpenCV defaults: 8 pyramid levels at scale 1.2, Harris corner ranking, 256-bit rBRIEF |
+| **SIFT** (COLMAP) | `colmap` back end; `colmap-from-vo` with `--matcher sift` | COLMAP's CPU SIFT with its default settings, matched by COLMAP's sequential matcher |
+| **DISK** | `colmap-from-vo` with `--matcher disk`; always in `pose-guided-refine` | learned detector + descriptor (Kornia, `depth` checkpoint), 8192 keypoints per frame, on CUDA |
+
+**Matching.**
+
+- **ORB:** brute-force Hamming 2-nearest-neighbour search with Lowe's ratio
+  test at 0.75. Despite the function name `match_mutual`, there is no
+  cross-check; the ratio test is the only filter before RANSAC.
+- **SIFT:** COLMAP sequential matching, each frame against the next
+  `--overlap` frames (default 20), with COLMAP's own geometric verification.
+- **DISK:** **LightGlue** (the `disk` weights), a transformer matcher that
+  pairs the keypoints of two frames jointly rather than descriptor by
+  descriptor. It runs on the same sequential window; pairs with fewer than
+  15 matches are dropped and the rest are verified with
+  `pycolmap.estimate_two_view_geometry` before being written to the COLMAP
+  database.
+
+**Chained VO (`vo.py`).** For each consecutive frame pair: essential matrix by
+RANSAC (`cv2.findEssentialMat`, 1 px threshold, 0.999 confidence),
+`recoverPose` for the cheirality-consistent `R, t`, then linear triangulation
+of the inliers. A pair is skipped below 30 matches or 20 RANSAC inliers, and
+points are kept only at 0.5–200 units of depth. Relative poses are chained
+from frame 0. Each step's translation has unit length, so the track has no
+consistent scale, and there is no bundle adjustment or loop closure, so it
+drifts. Its one strength is that it does not fail on pure forward motion.
+
+**GPS anchor.** If a `<video>.json` sidecar exists, GPS fixes are interpolated
+to the frame times, projected to local ENU metres, and a single **Umeyama**
+similarity (scale, rotation, translation) maps the VO camera centres onto
+them. Points and poses are transformed together. This sets global scale and
+heading but cannot repair per-step scale errors.
+
+**Densification (`colmap-from-vo`, `triangulate.py`).** The anchored VO poses
+are written out as a COLMAP reconstruction with no points. SIFT or
+DISK + LightGlue matches are then triangulated against those fixed poses
+(`pycolmap.triangulate_points`), and a global Ceres bundle adjustment refines
+poses, intrinsics and points together. GPS enters only through the anchor;
+pinning cameras to GPS inside the BA is available but off, because consumer
+GPS noise is larger than the residual it would correct.
+
+**Incremental SfM (`colmap`, `colmap_runner.py`).** COLMAP's standard mapper
+with thresholds relaxed for forward driving: initial pair accepted at a 4°
+triangulation angle (default 16°) and any forward-motion ratio, registration
+at 15 PnP inliers, points kept down to 0.5°. GPS fixes go in as Cartesian
+`PosePrior`s with covariance from the reported accuracy and a robust loss.
+
+**Pose-guided refinement (`pose-guided-refine`).** Takes an existing
+reconstruction and reruns DISK + LightGlue over a wider window (50 frames),
+using the known poses to reject matches before verification: Sampson epipolar
+distance must be under 4 px and the triangulation angle at least 1°. The
+angle test matters on forward motion, where the epipole lies inside the image
+and near-parallel rays pass the epipolar test while carrying no depth
+information. With a perception cache the sky and moving-object filters (B2,
+B4) also apply. The result is re-triangulated and bundle-adjusted with the
+first pose held fixed.
+
+**Models.**
+
+| Model | Choice |
+|---|---|
+| Camera, VO | pinhole guessed from an assumed 60° horizontal field of view, principal point at the image centre, no distortion; a placeholder, not a calibration |
+| Camera, COLMAP paths | one shared `SIMPLE_RADIAL` camera (focal length, principal point, one radial term), self-calibrated in bundle adjustment |
+| Motion | none in the base pipeline: no velocity model, IMU or wheel odometry. The custom-BA experiments below add motion priors (C3–C5) |
+| Learned networks | DISK and LightGlue for features; Mask2Former and Depth Pro only in the optional perception cache |
+| Optimiser | Ceres through pycolmap; the custom-BA experiments use SciPy `least_squares` |
+
 ### Algorithms
 
 | Stage | Module | Method |
