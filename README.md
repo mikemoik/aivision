@@ -155,6 +155,46 @@ from the raw KITTI calibration, loaded via `aivision.calibration.KittiCalibratio
 - **Output:** the raw TUM-format `CameraTrajectory.txt` is folded into
   `trajectory.json`: one camera-to-world `Twc` (3×4, metric) per frame.
 
+There is no neural network in this step. The only trained artefact is the
+bag-of-words vocabulary; everything else is hand-crafted features plus
+non-linear least squares.
+
+**Keypoints: ORB (oriented FAST + rotated BRIEF)**, ORB-SLAM's own extractor
+(`src/ORBextractor.cc`), not OpenCV's `cv::ORB`:
+
+| Stage | What it does |
+|---|---|
+| Pyramid | 8 levels, scale 1.2 (coarsest ≈ 3.6× downsampled); the 2000-feature budget is split geometrically, most on the finest level |
+| Detector | FAST-9/16 corners per ~35 px grid cell at threshold 20; a cell with no corner is retried at threshold 7, so low-texture road and sky still yield points |
+| Distribution | quadtree subdivision per level, keeping the highest-response corner in each leaf, for even image coverage |
+| Orientation | intensity centroid over a circular patch of radius 15 px |
+| Descriptor | 256-bit steered BRIEF (rBRIEF, learned 31×31 test pattern) on the 7×7 Gaussian-blurred level; compared by Hamming distance |
+
+**Stereo association** (`Frame::ComputeStereoMatches`): each left keypoint is
+matched to right keypoints on the same row band by descriptor (Hamming < 75),
+then refined to sub-pixel disparity by an 11×11 SAD window slid ±5 px with a
+parabola fit; matches with SAD above 2.1× the median are dropped. Depth is
+`bf / disparity`. Points closer than `ThDepth × baseline` = 35 × 0.537 ≈ 18.8 m
+are "close" (trusted from a single stereo frame); farther ones are only
+triangulated across views.
+
+**Models:**
+
+| Model | Choice |
+|---|---|
+| Camera | rectified pinhole, zero distortion, identical left/right intrinsics, pure-x baseline (`Camera.bf` = 0.5372 m × fx ≈ 379.8 px·m) |
+| Motion | constant-velocity prediction to seed projection matching; falls back to bag-of-words matching against the reference keyframe, then relocalisation |
+| Sensors | stereo only: no IMU, no GNSS, no wheel odometry |
+| Place recognition | DBoW2 with the stock `ORBvoc.txt` (k = 10, depth 6, ≈ 1 M words, TF-IDF, L1 score); used for relocalisation and loop closing. Seq 04 is a straight drive, so no loop ever closes |
+| Map | ORB-SLAM3 Atlas with one map; keyframes + covisibility graph + 3D map points |
+| Optimiser | g2o Levenberg–Marquardt with Huber kernels. Per-frame pose-only optimisation (4 rounds × 10 iterations, outliers re-classified each round at χ² 5.991 mono / 7.815 stereo); local bundle adjustment over the covisible keyframe window in the mapping thread |
+
+**Local patches to upstream** (commit `4452a3c`, UZ-SLAMLab/ORB_SLAM3):
+`stereo_kitti.cc` dumps all surviving map points to `MapPoints.txt` before
+shutdown (via an added `System::GetAtlas()`), `LoopClosing::mnFullBAIdx` is
+fixed from `bool` to `int`, and the CMake files and `build.sh` are adjusted
+for the local toolchain.
+
 Stereo gives metric scale directly. On seq 04 the trajectory scores
 ATE 0.19 m against KITTI ground truth after Sim(3) alignment
 (`pocs/common.evaluate`).
